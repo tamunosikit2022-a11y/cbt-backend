@@ -1,0 +1,42 @@
+# fly.toml — Scholars Syndicate Backend
+# Deploy: flyctl launch --no-deploy, then flyctl deploy
+
+app = "scholars-syndicate-backend"
+primary_region = "iad"  # US East — closest to Nigeria with good latency
+
+[build]
+  # Fly auto-detects Node.js from package.json
+
+[env]
+  PORT = "3000"
+  NODE_ENV = "production"
+
+[http_service]
+  internal_port = 3000
+  force_https   = true
+  auto_stop_machines  = false   # Keep alive — needed for Socket.io + cron
+  auto_start_machines = true
+  min_machines_running = 1      # Always 1 instance running
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  # Phase 2: bumped 512mb -> 1024mb. avr-gcc runs as a *separate* child
+  # process from Node during /api/simulation/compile (see compileController.js),
+  # so it stacks on top of Node's own --max-old-space-size, not inside it.
+  # Revert to 512mb if you drop the Arduino compile feature.
+  memory = "1024mb"
+  cpus   = 1
+
+[checks]
+  [checks.alive]
+    grace_period = "10s"
+    interval     = "30s"
+    method       = "GET"
+    path         = "/health"
+    port         = 3000
+    timeout      = "5s"
+    type         = "http"
