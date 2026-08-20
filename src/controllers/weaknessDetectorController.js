@@ -37,10 +37,11 @@ async function analyseWeaknesses(studentId) {
         SUM(CASE WHEN ea.is_correct THEN 1 ELSE 0 END)::numeric
         / NULLIF(COUNT(*),0) * 100, 1
       )                                    AS accuracy,
-      MAX(ea.answered_at)                  AS last_seen
+      MAX(ea.created_at)                  AS last_seen
     FROM exam_answers ea
+    JOIN exam_sessions es ON es.id = ea.session_id
     JOIN questions q ON q.id = ea.question_id
-    WHERE ea.student_id = $1
+    WHERE es.student_id = $1
     GROUP BY q.subject, q.topic
     HAVING COUNT(*) >= 3
     ORDER BY accuracy ASC, total DESC
@@ -162,8 +163,9 @@ async function trackWeaknessProgress(studentId) {
       SELECT q.subject, COALESCE(q.topic,'General') as topic,
              ROUND(AVG(CASE WHEN ea.is_correct THEN 100.0 ELSE 0 END), 1) as accuracy
       FROM exam_answers ea
+      JOIN exam_sessions es ON es.id = ea.session_id
       JOIN questions q ON q.id=ea.question_id
-      WHERE ea.student_id=$1 AND ea.answered_at > NOW() - INTERVAL '7 days'
+      WHERE es.student_id=$1 AND ea.created_at > NOW() - INTERVAL '7 days'
       GROUP BY q.subject, q.topic
     `, [studentId]).catch(() => ({ rows: [] })),
 
@@ -171,9 +173,10 @@ async function trackWeaknessProgress(studentId) {
       SELECT q.subject, COALESCE(q.topic,'General') as topic,
              ROUND(AVG(CASE WHEN ea.is_correct THEN 100.0 ELSE 0 END), 1) as accuracy
       FROM exam_answers ea
+      JOIN exam_sessions es ON es.id = ea.session_id
       JOIN questions q ON q.id=ea.question_id
-      WHERE ea.student_id=$1
-        AND ea.answered_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days'
+      WHERE es.student_id=$1
+        AND ea.created_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days'
       GROUP BY q.subject, q.topic
     `, [studentId]).catch(() => ({ rows: [] })),
   ]);

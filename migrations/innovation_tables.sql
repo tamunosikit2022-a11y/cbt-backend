@@ -329,19 +329,19 @@ CREATE TABLE IF NOT EXISTS weakness_practice_sessions (
 );
 
 -- ────────────────────────────────────────────────────────────────
--- EXAM ANSWERS (needed by weakness detector — add if not exists)
+-- EXAM ANSWERS -- FIX: this used to CREATE TABLE IF NOT EXISTS exam_answers
+-- with a student_id/exam_id/answered_at shape, assuming the table didn't
+-- exist yet. It actually already existed in production with a different,
+-- correct shape (session_id -> exam_sessions.id, created_at, explanation --
+-- see examController.js's real INSERT). Because IF NOT EXISTS silently
+-- skipped creating this version, the CREATE INDEX right after it failed
+-- with "column student_id does not exist" the moment this migration
+-- actually ran, rolling back cleanly (schema_migrations only records a
+-- file as applied on success). The real exam_answers table is fine and
+-- doesn't need anything added here -- weaknessDetectorController.js was
+-- the actual bug (querying columns that were never real), fixed separately
+-- to JOIN through exam_sessions instead.
 -- ────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS exam_answers (
-  id            BIGSERIAL    PRIMARY KEY,
-  student_id    INTEGER      NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-  exam_id       INTEGER,
-  question_id   INTEGER,
-  is_correct    BOOLEAN      NOT NULL DEFAULT FALSE,
-  time_taken_ms INTEGER,
-  answered_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_exam_answers_student ON exam_answers(student_id);
-CREATE INDEX IF NOT EXISTS idx_exam_answers_question ON exam_answers(question_id);
 
 -- ────────────────────────────────────────────────────────────────
 -- AI QUIZ GENERATOR — VIDEO TABLE (add transcript col if needed)
