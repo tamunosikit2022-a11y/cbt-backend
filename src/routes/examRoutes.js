@@ -20,6 +20,7 @@ router.get("/heatmap",         exam.getWeaknessHeatmap);
 router.get("/state-leaderboard", exam.getStateLeaderboard);
 // FIX: reload full session results with explanations (for History / revisit)
 router.get("/session/:id",     exam.getSessionResults);
+router.post("/questions/:id/report", exam.reportQuestion);
 
 router.get('/university-course-counts', exam.getUniversityCounts);
 module.exports = router;

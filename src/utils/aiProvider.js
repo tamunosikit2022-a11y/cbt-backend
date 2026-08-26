@@ -17,6 +17,27 @@
  * ('quick', 'compile', or omitted) tries Groq first, same as before. This
  * is purely a default request enhancement — either provider still falls
  * back to the other automatically on a retryable error either way.
+ *
+ * ADAPTIVE SPLIT (circuit breaker) + TIMEOUT: the taskType preference above
+ * is a *starting* bias, not a rule that ignores reality. Two problems the
+ * static version had:
+ *   1. No timeout — a provider that hangs (rather than erroring) never
+ *      triggers fallback; the request just sits until whatever default
+ *      HTTP timeout the SDK uses eventually fires, which can be a long
+ *      time on a student's exam-mode connection.
+ *   2. No memory of recent failures — if Groq is down, every single
+ *      request still tries Groq first, wastes a full timeout, THEN falls
+ *      over to Gemini. Under any real outage that's every request paying
+ *      the timeout cost, not just the first one that discovers it.
+ * A small in-memory circuit breaker per provider fixes both: each call is
+ * wrapped in a hard timeout that counts as a retryable failure, and after
+ * a few consecutive failures a provider is marked "open" (skipped as the
+ * first choice) for a cooldown window, then given one "half-open" trial
+ * request to check if it's recovered before fully reopening either way.
+ * This is process-local state (resets on restart/deploy) — deliberately
+ * simple rather than a shared Redis-backed breaker, since the cost of a
+ * false "still open" after a restart is just one wasted attempt, not a
+ * correctness problem.
  */
 const Groq = require('groq-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -46,6 +67,61 @@ function getGemini() {
 // since Google deprecates Gemini models fairly often.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
+// Hard per-attempt timeout. A hang is treated exactly like a retryable
+// error — it trips the circuit breaker below and (if the other provider
+// is healthy) triggers fallback, instead of leaving the request to hang
+// on whatever the underlying SDK's own default timeout happens to be.
+const PROVIDER_TIMEOUT_MS = 25000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(`${label} timed out after ${ms}ms`), { code: 'PROVIDER_TIMEOUT' })), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ── Circuit breaker state (process-local, in-memory) ──────────────────
+const BREAKER_FAILURE_THRESHOLD = 3;     // consecutive failures before opening
+const BREAKER_COOLDOWN_MS       = 30000; // how long a provider is skipped-as-first-choice once open
+
+const breakers = {
+  groq:   { failures: 0, openUntil: 0 },
+  gemini: { failures: 0, openUntil: 0 },
+};
+
+function isOpen(name) {
+  return Date.now() < breakers[name].openUntil;
+}
+
+function recordSuccess(name) {
+  breakers[name].failures = 0;
+  breakers[name].openUntil = 0;
+}
+
+function recordFailure(name) {
+  const b = breakers[name];
+  b.failures++;
+  if (b.failures >= BREAKER_FAILURE_THRESHOLD) {
+    b.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+    console.warn(`[aiProvider] Circuit breaker OPEN for ${name} — ${b.failures} consecutive failures, skipping as first choice for ${BREAKER_COOLDOWN_MS / 1000}s.`);
+  }
+}
+
+// Exposed for monitoring/debugging (e.g. an admin health-check route) —
+// not used internally beyond what's above.
+function getProviderHealth() {
+  const now = Date.now();
+  return Object.fromEntries(Object.entries(breakers).map(([name, b]) => [
+    name,
+    {
+      failures: b.failures,
+      open: now < b.openUntil,
+      reopensInMs: Math.max(0, b.openUntil - now),
+    },
+  ]));
+}
+
 // Only fail over on errors that indicate Groq is overloaded/unavailable/
 // unusable — NOT on 4xx errors like a malformed prompt, which would just
 // fail the same way on Gemini and waste a round trip.
@@ -63,6 +139,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 // also fall back to Gemini for Groq auth/config/model errors, not just
 // infra-level 5xx/timeouts.
 function isRetryableError(err) {
+  if (err?.code === 'PROVIDER_TIMEOUT') return true;
   const status = err?.status || err?.response?.status;
   if ([401, 403, 404, 429, 500, 502, 503, 504].includes(status)) return true;
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED'].includes(err?.code)) return true;
@@ -72,15 +149,17 @@ function isRetryableError(err) {
 }
 
 /**
- * OpenAI/Groq-style chat completion with automatic Gemini fallback, and
- * optional task-aware provider selection (see `taskType`).
+ * OpenAI/Groq-style chat completion with automatic Gemini fallback,
+ * task-aware provider selection, a per-attempt timeout, and an adaptive
+ * circuit breaker that steers traffic away from a currently-unhealthy
+ * provider without ever fully giving up on it.
  *
  * @param {Array<{role: 'system'|'user'|'assistant', content: string}>} messages
  * @param {string}  [model]        Groq model to try first
  * @param {number}  [maxTokens]
  * @param {number}  [temperature]
  * @param {boolean} [jsonMode]     Ask for a raw JSON object response
- * @param {string}  [taskType]     'quick'|'compile'|'tutor'|'explain' — 'tutor'/'explain' try Gemini first, everything else tries Groq first (default, unchanged behavior)
+ * @param {string}  [taskType]     'quick'|'compile'|'tutor'|'explain' — 'tutor'/'explain' bias toward Gemini first, everything else biases toward Groq first. Overridden by the circuit breaker if the biased-toward provider is currently open.
  * @returns {Promise<{content: string, tokensUsed: number, provider: 'groq'|'gemini'}>}
  */
 async function chatCompletion({
@@ -98,32 +177,55 @@ async function chatCompletion({
   taskType,
 }) {
   const hasGemini = !!process.env.GEMINI_API_KEY;
-  const preferGemini = hasGemini && ['tutor', 'explain'].includes(taskType);
+
+  // Starting bias from taskType, then let the circuit breaker override it:
+  // if the task-preferred provider is currently open (unhealthy) and the
+  // other one isn't, swap. If BOTH are open, keep the original preference
+  // anyway — trying the "least recently failing" option is still better
+  // than refusing to try at all, and one of them will likely have
+  // recovered by the time this request lands.
+  let preferGemini = hasGemini && ['tutor', 'explain'].includes(taskType);
+  if (hasGemini) {
+    if (preferGemini && isOpen('gemini') && !isOpen('groq')) preferGemini = false;
+    else if (!preferGemini && isOpen('groq') && !isOpen('gemini')) preferGemini = true;
+  }
 
   if (preferGemini) {
     try {
-      return await _geminiCompletion({ messages, maxTokens, temperature, jsonMode });
+      const result = await withTimeout(
+        _geminiCompletion({ messages, maxTokens, temperature, jsonMode }),
+        PROVIDER_TIMEOUT_MS, 'Gemini'
+      );
+      recordSuccess('gemini');
+      return result;
     } catch (geminiErr) {
       if (!isRetryableError(geminiErr)) throw geminiErr;
+      recordFailure('gemini');
       console.warn(`[aiProvider] Gemini failed (${geminiErr.message}) — falling back to Groq.`);
       // falls through to the normal Groq attempt below
     }
   }
 
   try {
-    const completion = await getGroq().chat.completions.create({
-      model,
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-      ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
-    });
+    const completion = await withTimeout(
+      getGroq().chat.completions.create({
+        model,
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+        ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+      }),
+      PROVIDER_TIMEOUT_MS, 'Groq'
+    );
+    recordSuccess('groq');
     return {
       content: completion.choices[0].message.content,
       tokensUsed: completion.usage?.total_tokens || 0,
       provider: 'groq',
     };
   } catch (groqErr) {
+    recordFailure('groq');
+
     // Already tried Gemini above and it also failed — don't try it again,
     // surface the original Groq error.
     if (preferGemini) throw groqErr;
@@ -132,7 +234,12 @@ async function chatCompletion({
     if (!canFallback) throw groqErr;
 
     console.warn(`[aiProvider] Groq failed (${groqErr.message}) — falling back to Gemini.`);
-    return await _geminiCompletion({ messages, maxTokens, temperature, jsonMode });
+    const result = await withTimeout(
+      _geminiCompletion({ messages, maxTokens, temperature, jsonMode }),
+      PROVIDER_TIMEOUT_MS, 'Gemini'
+    );
+    recordSuccess('gemini');
+    return result;
   }
 }
 
@@ -164,4 +271,4 @@ async function _geminiCompletion({ messages, maxTokens, temperature, jsonMode })
   };
 }
 
-module.exports = { chatCompletion, isRetryableError, getGroq, getGemini };
+module.exports = { chatCompletion, isRetryableError, getGroq, getGemini, getProviderHealth };

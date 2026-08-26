@@ -68,7 +68,34 @@ exports.sendFriendRequest = async (req, res) => {
     );
     if (areFriends.rows.length) return res.status(400).json({ error: 'Already friends.' });
 
-    // Pending request already?
+    // FIX: this only checked for a duplicate request in the SAME
+    // direction (from=me, to=them). It never checked whether THEY had
+    // already sent ME a pending request — so if both people happened to
+    // send a request to each other before either accepted, you'd end up
+    // with two separate pending rows going opposite directions forever,
+    // neither side ever becoming friends unless one of them specifically
+    // opened "pending requests" and noticed the other's. The natural,
+    // expected behavior — two people requesting each other means they're
+    // friends — was never actually implemented. Now checks for a reverse
+    // pending request first and auto-accepts it instead of creating a
+    // redundant duplicate.
+    const reverse = await db.query(
+      `SELECT id FROM friend_requests WHERE from_id=$1 AND to_id=$2 AND status='pending'`,
+      [toId, from]
+    );
+    if (reverse.rows.length) {
+      await db.query(`UPDATE friend_requests SET status='accepted' WHERE id=$1`, [reverse.rows[0].id]);
+      const [a, b] = [from, toId].sort();
+      await db.query(`INSERT INTO friends (student_a, student_b) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [a, b]);
+      return res.json({ success: true, status: 'accepted', message: 'They already requested you — you\'re now friends!' });
+    }
+
+    // Pending request already? (same direction)
+    // FIX: this check-then-insert isn't atomic on its own — a genuine
+    // double-tap could still slip two identical pending rows through.
+    // Added as a real DB constraint instead (migrations/
+    // friend_request_uniqueness.sql) so a concurrent duplicate fails the
+    // unique constraint rather than racing past this SELECT.
     const existing = await db.query(
       `SELECT id FROM friend_requests
        WHERE from_id=$1 AND to_id=$2 AND status='pending'`,
@@ -80,10 +107,14 @@ exports.sendFriendRequest = async (req, res) => {
       `INSERT INTO friend_requests (from_id, to_id, status)
        VALUES ($1,$2,'pending') RETURNING id`,
       [from, toId]
-    );
+    ).catch(err => {
+      if (err.code === '23505') { const e = new Error('Request already sent.'); e.code = 'DUPLICATE'; throw e; }
+      throw err;
+    });
 
     res.json({ success: true, requestId: result.rows[0].id });
   } catch (err) {
+    if (err.code === 'DUPLICATE') return res.status(400).json({ error: err.message });
     serverError(res, err);
   }
 };
@@ -223,12 +254,6 @@ exports.inviteToSquad = async (req, res) => {
     );
     if (!sq.rows.length) return res.status(403).json({ error: 'Not your squad.' });
 
-    const memberCount = await db.query(
-      `SELECT COUNT(*) as cnt FROM squad_members WHERE squad_id=$1`, [squadId]
-    );
-    if (parseInt(memberCount.rows[0].cnt) >= 5)
-      return res.status(400).json({ error: 'Squad is full (max 5).' });
-
     // Are they friends?
     const [a, b] = [me, targetId].sort();
     const areFriends = await db.query(
@@ -237,7 +262,18 @@ exports.inviteToSquad = async (req, res) => {
     if (!areFriends.rows.length)
       return res.status(400).json({ error: 'Can only invite friends.' });
 
-    // Issue squad invite via friend_requests table (reuse with type='squad')
+    // FIX: this used to check squad capacity (< 5) here, at invite time —
+    // but that's the wrong stage entirely, and doesn't actually check
+    // anything meaningful once more than one invite exists. A captain
+    // with 1 free slot could invite 5 different friends (this check
+    // passes every single time, since it's still true count<5 for each
+    // separate invite call), and acceptSquadInvite had NO capacity check
+    // at all — so all 5 could accept and the squad balloons to 6
+    // members, blowing past the intended 5-member cap. The real capacity
+    // check now lives in acceptSquadInvite, at the moment a member
+    // actually joins, done atomically — see the FIX comment there. This
+    // endpoint no longer checks capacity at all; it's not the point
+    // where capacity is actually consumed.
     await db.query(
       `INSERT INTO squad_invites (squad_id, from_id, to_id, status)
        VALUES ($1,$2,$3,'pending')
@@ -268,10 +304,26 @@ exports.acceptSquadInvite = async (req, res) => {
     // Leave current squad
     await db.query(`DELETE FROM squad_members WHERE student_id=$1`, [me]).catch(() => {});
 
-    await db.query(
-      `INSERT INTO squad_members (squad_id, student_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+    // FIX: the actual capacity check, moved here from inviteToSquad (see
+    // comment there) and made atomic — the subquery re-counts inside the
+    // same INSERT statement, so Postgres evaluates capacity per-row
+    // rather than leaving a window between a separate count check and
+    // the write (same pattern as tournament registration's capacity fix
+    // earlier this session). A captain can now safely invite more people
+    // than there's room for (e.g. to have backups in case some decline)
+    // without it being possible for more than 5 to actually land in the
+    // squad — whoever accepts first gets the remaining slots, the rest
+    // get a clean "squad is full" instead of silently succeeding.
+    const inserted = await db.query(
+      `INSERT INTO squad_members (squad_id, student_id)
+       SELECT $1, $2
+       WHERE (SELECT COUNT(*) FROM squad_members WHERE squad_id=$1) < 5
+       ON CONFLICT DO NOTHING
+       RETURNING student_id`,
       [squad_id, me]
     );
+    if (!inserted.rows.length) return res.status(400).json({ error: 'Squad is full (max 5).' });
+
     await db.query(
       `UPDATE squad_invites SET status='accepted' WHERE id=$1`, [inviteId]
     );

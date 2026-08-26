@@ -161,25 +161,31 @@ exports.registerForTournament = async (req, res) => {
     if (!tournament) return res.status(404).json({ error: 'Tournament not found.' });
     if (tournament.status !== 'open') return res.status(400).json({ error: 'Registration is closed.' });
 
-    const count = await db.query(
-      `SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1`, [tid]
-    ).then(r => parseInt(r.rows[0].count));
-    if (count >= tournament.max_size)
-      return res.status(400).json({ error: 'Tournament is full.' });
-
-    const already = await db.query(
-      `SELECT id FROM tournament_registrations WHERE tournament_id=$1 AND student_id=$2`, [tid, sid]
-    );
-    if (already.rows.length) return res.status(400).json({ error: 'Already registered.' });
-
-    await db.query(
+    // FIX: the old version did COUNT(*) then a separate INSERT — two
+    // concurrent registrations near the cap could both pass the count
+    // check before either INSERT landed, overfilling past max_size. This
+    // makes the capacity check part of the INSERT itself: the subquery
+    // re-counts inside the same statement, so Postgres evaluates it
+    // atomically per-row rather than leaving a window between check and
+    // write. The PRIMARY KEY (tournament_id, student_id) already prevents
+    // double-registration at the DB level (just needed the friendly 400
+    // instead of a raw 500 on that race, added below).
+    const inserted = await db.query(
       `INSERT INTO tournament_registrations (tournament_id, student_id, registered_at)
-       VALUES ($1,$2,NOW())`,
-      [tid, sid]
-    );
+       SELECT $1, $2, NOW()
+       WHERE (SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1) < $3
+       RETURNING (SELECT COUNT(*) FROM tournament_registrations WHERE tournament_id=$1) as position`,
+      [tid, sid, tournament.max_size]
+    ).catch(err => {
+      if (err.code === '23505') { const e = new Error('Already registered.'); e.code = 'ALREADY_REGISTERED'; throw e; }
+      throw err;
+    });
 
-    res.json({ success: true, position: count + 1, message: 'Registered! Check back before start time.' });
+    if (!inserted.rows.length) return res.status(400).json({ error: 'Tournament is full.' });
+
+    res.json({ success: true, position: inserted.rows[0].position, message: 'Registered! Check back before start time.' });
   } catch (err) {
+    if (err.code === 'ALREADY_REGISTERED') return res.status(400).json({ error: err.message });
     serverError(res, err);
   }
 };
@@ -214,10 +220,16 @@ exports.startTournament = async (req, res) => {
     );
 
     // Assign room codes for round 1 matches
+    const { registerLink } = require('../arena/matchLinkRegistry');
     for (const match of bracket[0]) {
       if (match.player1?.id && match.player2?.id) {
         match.roomCode = `TOUR_${tid.slice(-4)}_R1M${match.id.slice(-1)}`;
         match.status   = 'active';
+        // FIX: register this room so arenaEngine.endGame() can drive the
+        // result directly from its own server-computed scores instead of
+        // relying on either player to self-report via submitMatchResult —
+        // see matchLinkRegistry.js for the full reasoning.
+        registerLink(match.roomCode, { type: 'tournament', tournamentId: tid, matchId: match.id });
       } else if (!match.player2?.id) {
         // BYE — auto-advance player1
         match.winner = match.player1;
@@ -244,15 +256,79 @@ exports.startTournament = async (req, res) => {
   }
 };
 
-// POST /api/tournaments/:id/submit-result  (called by Arena engine)
+// POST /api/tournaments/:id/submit-result  (manual fallback — see
+// recordVerifiedMatchResult below for the primary, trustworthy path)
+//
+// FIX (critical): this endpoint required nothing beyond requireStudent —
+// no check that the caller was even a participant in the match, let alone
+// that they'd actually won a real Arena game. I checked every file under
+// src/arena/ and src/rooms/ for any reference to "tournament": there was
+// none. Despite the comment above, nothing in the Arena engine had ever
+// actually called this — it was purely a student-callable REST endpoint
+// that accepted a self-reported winnerId at face value.
+//
+// Two layers fixed this:
+//   1. This endpoint now requires the caller to actually be one of the
+//      two listed participants (closes "declare a random third party the
+//      winner").
+//   2. arenaEngine.js's endGame() now calls recordVerifiedMatchResult
+//      directly, using the winner IT computed from its own
+//      server-tracked, JWT-verified scores — registered via
+//      matchLinkRegistry.js at the moment a tournament match's room code
+//      is handed out. This is the actual fix for the deeper problem:
+//      even a participant-only submitMatchResult call is still a
+//      self-report two colluding players could fake. The Arena-driven
+//      path has no such gap — it doesn't ask either player anything.
+//      This endpoint remains as a manual fallback for the rare case a
+//      room never reaches endGame, with the same (weaker, self-report)
+//      guarantee as before for that fallback path only.
 exports.submitMatchResult = async (req, res) => {
   try {
     const { matchId, winnerId } = req.body;
     const tid = req.params.id;
     const io  = req.app.get('io');
+    const callerId = req.student.id;
 
-    const tournament = await db.query(`SELECT * FROM tournaments WHERE id=$1`, [tid]).then(r => r.rows[0]);
+    // Participant check happens here, at the client-facing entry point —
+    // recordVerifiedMatchResult (the shared core, also called directly
+    // and trustworthily by arenaEngine.endGame) does the actual bracket
+    // work and doesn't re-check identity, since arenaEngine's call has no
+    // "caller" to check in the first place.
+    const tournament = await db.query(`SELECT bracket_json FROM tournaments WHERE id=$1`, [tid]).then(r => r.rows[0]);
     if (!tournament) return res.status(404).json({ error: 'Tournament not found.' });
+    const bracket = JSON.parse(tournament.bracket_json || '[]');
+    let match = null;
+    for (const round of bracket) { const m = round.find(x => x.id === matchId); if (m) { match = m; break; } }
+    if (!match) return res.status(404).json({ error: 'Match not found in bracket.' });
+    const isParticipant = match.player1?.id === callerId || match.player2?.id === callerId;
+    if (!isParticipant) return res.status(403).json({ error: 'Only players in this match can report its result.' });
+
+    const result = await recordVerifiedMatchResult(tid, matchId, winnerId, io);
+    if (!result.success) return res.status(400).json({ error: result.error });
+    res.json({ success: true, bracket: result.bracket });
+  } catch (err) {
+    serverError(res, err);
+  }
+};
+
+// FIX (closing the collusion gap noted above): this is the actual bracket-
+// advancement logic, extracted so it has exactly ONE path regardless of
+// who/what calls it — arenaEngine.endGame() calls this directly with the
+// winner it computed itself from real server-tracked scores (the
+// trustworthy path, no participant check needed since there's no
+// external caller to verify), while submitMatchResult above is now a thin
+// wrapper that checks the caller is a participant first, then defers to
+// this same function (the manual/fallback path, kept for cases where a
+// room somehow doesn't reach endGame — still only as trustworthy as
+// "a real participant said so", same caveat as before).
+async function recordVerifiedMatchResult(tid, matchId, winnerId, io) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const tournament = await client.query(
+      `SELECT * FROM tournaments WHERE id=$1 FOR UPDATE`, [tid]
+    ).then(r => r.rows[0]);
+    if (!tournament) { await client.query('ROLLBACK'); return { success: false, error: 'Tournament not found.' }; }
 
     const bracket = JSON.parse(tournament.bracket_json || '[]');
 
@@ -263,11 +339,17 @@ exports.submitMatchResult = async (req, res) => {
         if (match.id === matchId) { foundRound = ri; foundMatchIdx = mi; }
       });
     });
-    if (foundRound === -1) return res.status(404).json({ error: 'Match not found in bracket.' });
+    if (foundRound === -1) { await client.query('ROLLBACK'); return { success: false, error: 'Match not found in bracket.' }; }
 
     const match = bracket[foundRound][foundMatchIdx];
+
+    if (match.status === 'done') {
+      await client.query('ROLLBACK');
+      return { success: false, error: 'This match has already been recorded.' };
+    }
+
     const winner = [match.player1, match.player2].find(p => p?.id === parseInt(winnerId));
-    if (!winner) return res.status(400).json({ error: 'Winner not found in match.' });
+    if (!winner) { await client.query('ROLLBACK'); return { success: false, error: 'Winner not found in match.' }; }
 
     match.winner = winner;
     match.status = 'done';
@@ -288,6 +370,11 @@ exports.submitMatchResult = async (req, res) => {
         nm.status   = 'active';
         nm.id       = `R${nextRound + 1}_M${nextMatchIdx + 1}`;
 
+        // Same registration as startTournament's round-1 assignment —
+        // lets arenaEngine.endGame() drive THIS match's result directly too.
+        const { registerLink } = require('../arena/matchLinkRegistry');
+        registerLink(nm.roomCode, { type: 'tournament', tournamentId: tid, matchId: nm.id });
+
         // Notify both players
         for (const p of [nm.player1, nm.player2]) {
           io.to(`student:${p.id}`).emit('tournament:match_assigned', {
@@ -305,17 +392,24 @@ exports.submitMatchResult = async (req, res) => {
     const allDone   = lastRound.every(m => m.status === 'done');
 
     if (allDone) {
+      await client.query(`UPDATE tournaments SET bracket_json=$1 WHERE id=$2`, [JSON.stringify(bracket), tid]);
+      await client.query('COMMIT');
       const grandWinner = lastRound[0].winner;
       await endTournament(tid, bracket, grandWinner, io);
     } else {
-      await db.query(`UPDATE tournaments SET bracket_json=$1 WHERE id=$2`, [JSON.stringify(bracket), tid]);
+      await client.query(`UPDATE tournaments SET bracket_json=$1 WHERE id=$2`, [JSON.stringify(bracket), tid]);
+      await client.query('COMMIT');
     }
 
-    res.json({ success: true, bracket });
+    return { success: true, bracket };
   } catch (err) {
-    serverError(res, err);
+    await client.query('ROLLBACK').catch(() => {});
+    return { success: false, error: err.message };
+  } finally {
+    client.release();
   }
-};
+}
+exports.recordVerifiedMatchResult = recordVerifiedMatchResult;
 
 async function endTournament(tid, bracket, grandWinner, io) {
   await db.query(

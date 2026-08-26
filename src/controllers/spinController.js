@@ -117,13 +117,42 @@ exports.doSpin = async (req, res) => {
 
     const spinField  = useSlot2 ? "last_spin2_at" : "last_spin_at";
 
-    // Charge token for second spin — AFTER confirming column exists
+    // FIX: the cooldown check above (canSpin1/canSpin2, computed from a
+    // SELECT moments earlier) and the reward-granting UPDATE below used
+    // to be two separate round-trips — not atomic. Two concurrent spin
+    // requests (double-tap, retry-on-slow-network) could both read the
+    // old last_spin_at before either UPDATE landed, both pass the
+    // cooldown check, and both go on to award a reward — same race
+    // already fixed in treasureChestController/missionsController this
+    // session. Claim the spin slot atomically first: only proceed to
+    // pick/award a reward if this exact request's UPDATE actually
+    // advanced last_spin_at (i.e. WHERE clause still matches the stale
+    // value we read) — the loser gets a clean "already spun" instead of
+    // a second reward.
+    const claimField = spinField;
+    const staleValue = useSlot2 ? lastSpin2 : lastSpin;
+    const claim = await db.query(
+      staleValue
+        ? `UPDATE students SET ${claimField}=NOW() WHERE id=$1 AND ${claimField}=$2 RETURNING id`
+        : `UPDATE students SET ${claimField}=NOW() WHERE id=$1 AND ${claimField} IS NULL RETURNING id`,
+      staleValue ? [sid, staleValue] : [sid]
+    );
+    if (!claim.rows.length) {
+      return res.status(400).json({ error: "Already spun today. Come back tomorrow!" });
+    }
+
+    // Charge token for second spin — AFTER confirming column exists AND
+    // this request actually won the atomic claim above (so a losing
+    // concurrent request never gets charged a token for nothing).
     if (useSlot2) {
       const { spendTokens } = require('./tokenController');
       try {
         await spendTokens(sid, 'extra_spin');
       } catch (tokenErr) {
         if (tokenErr.code === 'INSUFFICIENT_TOKENS') {
+          // Already claimed the spin slot above — release it back so the
+          // student isn't charged the slot without getting a spin.
+          await db.query(`UPDATE students SET ${claimField}=$2 WHERE id=$1`, [sid, staleValue ?? null]).catch(() => {});
           return res.status(400).json({ error: "Your free spin is used up. Buy tokens for an extra spin — 1 token per spin!", code: "INSUFFICIENT_TOKENS" });
         }
         throw tokenErr;
@@ -133,7 +162,7 @@ exports.doSpin = async (req, res) => {
     const reward = pickReward();
 
     // Award the reward — gems type now credits token_balance (unified currency)
-    let updateSQL = `UPDATE students SET ${spinField}=NOW()`;
+    let updateSQL = `UPDATE students SET updated_at=NOW()`;
     if      (reward.type === "coins")  updateSQL += `, coins=COALESCE(coins,0)+${parseInt(reward.value)}`;
     else if (reward.type === "gems")   updateSQL += `, token_balance=COALESCE(token_balance,0)+${parseInt(reward.value)}`;
     else if (reward.type === "tokens") updateSQL += `, token_balance=COALESCE(token_balance,0)+${parseInt(reward.value)}`;

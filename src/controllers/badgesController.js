@@ -82,6 +82,11 @@ const TITLES = [
   { id: 'blitz_god',        name: 'Blitz God',         color: '#F59E0B', rarity: 'legendary', unlock: 'blitz_wins_20' },
   { id: 'midnight_scholar', name: 'Midnight Scholar',  color: '#1E3A5F', rarity: 'secret',    unlock: 'study_past_midnight_10' },
   { id: 'obsessive',        name: 'Obsessive',         color: '#6B7280', rarity: 'secret',    unlock: 'sessions_1000' },
+  // FIX: awarded as a spin_events prize (season_finale event, see
+  // seasonCosmeticsController.buildEventSpinPrizes) but was never added
+  // here — a student "winning" it via the spin wheel got nothing, since
+  // awardSpinPrize's title branch had nowhere to look it up for display.
+  { id: 'season_legend',    name: 'Season Legend',     color: '#FFC857', rarity: 'legendary', unlock: 'event_spin_season_finale' },
 ];
 
 // ── HELPERS ───────────────────────────────────────────────
@@ -143,7 +148,7 @@ async function awardTitle(studentId, titleId, io) {
 
 async function checkBadgesForStudent(studentId, io) {
   try {
-    const [stats, badgesOwned] = await Promise.all([
+    const [stats, academicStats, badgesOwned] = await Promise.all([
       db.query(`
         SELECT
           COALESCE(streak,0)                                     AS streak,
@@ -169,6 +174,27 @@ async function checkBadgesForStudent(studentId, io) {
         FROM students WHERE id=$1
       `, [studentId]).then(r => r.rows[0] || {}),
 
+      // FIX: these 6 academic badges (physics_master, biology_titan,
+      // english_genius, chemistry_wizard, math_god, all_rounder) were
+      // defined in the catalogue with real descriptions shown to
+      // students, but had no corresponding check anywhere — they were
+      // permanently unwinnable no matter what a student did. exam_sessions
+      // already stores subject + percentage per completed exam (see
+      // examController.submitExam's INSERT), so this is directly
+      // computable with one aggregate query — no new tracking needed.
+      // Subject strings matched against the exact naming used elsewhere
+      // in this codebase (careerController.js's jamb_subjects lists).
+      db.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE subject='Physics' AND percentage>=90)          AS physics_90_count,
+          COUNT(*) FILTER (WHERE subject='Biology' AND percentage>=90)          AS biology_90_count,
+          COUNT(*) FILTER (WHERE subject='English Language' AND percentage>=90) AS english_90_count,
+          COUNT(*) FILTER (WHERE subject='Chemistry' AND percentage>=90)        AS chemistry_90_count,
+          COUNT(*) FILTER (WHERE subject='Mathematics' AND percentage=100)      AS math_100_count,
+          COUNT(DISTINCT subject) FILTER (WHERE percentage>=80)                 AS subjects_80_count
+        FROM exam_sessions WHERE student_id=$1
+      `, [studentId]).then(r => r.rows[0] || {}).catch(() => ({})),
+
       db.query(
         `SELECT badge_id FROM student_badges WHERE student_id=$1`, [studentId]
       ).then(r => new Set(r.rows.map(b => b.badge_id))),
@@ -185,6 +211,12 @@ async function checkBadgesForStudent(studentId, io) {
     check(parseInt(stats.streak) >= 100,               'study_streak_100');
     check(parseInt(stats.pdfs_unlocked) >= 10,         'knowledge_vault_pro');
     check(parseInt(stats.flashcard_sessions) >= 100,   'flashcard_fanatic');
+    check(parseInt(academicStats.physics_90_count)   >= 10, 'physics_master');
+    check(parseInt(academicStats.biology_90_count)   >= 10, 'biology_titan');
+    check(parseInt(academicStats.english_90_count)   >= 10, 'english_genius');
+    check(parseInt(academicStats.chemistry_90_count) >= 10, 'chemistry_wizard');
+    check(parseInt(academicStats.math_100_count)     >= 1,  'math_god');
+    check(parseInt(academicStats.subjects_80_count)  >= 5,  'all_rounder');
 
     // Competitive
     check(parseInt(stats.arena_wins) >= 50,            'arena_monster');
@@ -209,7 +241,22 @@ async function checkBadgesForStudent(studentId, io) {
     check(parseInt(stats.study_room_hosted) >= 10,     'voice_room_host');
 
     // Secret
-    check(parseInt(stats.arena_wins) === 0 && parseInt(stats.total_sessions) > 0, 'first_blood'); // first arena win check is done at win event
+    // FIX (high-impact bug): this line awarded 'first_blood' — meant to
+    // be a rare secret badge for winning your FIRST EVER Arena match —
+    // to literally every student who has taken at least one practice
+    // exam and has zero arena wins. That's the inverse of "won their
+    // first arena battle": it fires for students who haven't played
+    // Arena at all. Since checkBadgesForStudent runs after every single
+    // exam submission (examController.js), this meant the vast majority
+    // of the entire userbase — anyone who just does practice exams and
+    // never touches Arena — was getting a "secret" badge that's supposed
+    // to be rare and exciting, on their very first exam. The correct,
+    // working implementation already exists and runs separately:
+    // checkFirstArenaWin() in this same file, called from
+    // arenaEngine.js only when isWin is true and only checks
+    // `wins === 1` — exactly right. This line was a redundant duplicate
+    // with inverted logic; removed rather than fixed in place, since the
+    // real check already exists and works correctly elsewhere.
     check(parseInt(stats.total_sessions) >= 1000,      'obsessed');
     check(parseInt(stats.midnight_sessions) >= 10,     'midnight_grind');
 

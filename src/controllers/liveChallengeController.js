@@ -70,8 +70,15 @@ function initLiveChallenges(io) {
   io.on('connection', socket => {
 
     // ── SEND A CHALLENGE ─────────────────────────────────
-    socket.on('challenge:send', async ({ challengerId, challengerName, targetId, subject }, cb) => {
+    socket.on('challenge:send', async ({ challengerName, targetId, subject }, cb) => {
       try {
+        // FIX: challengerId used to come straight from the client payload
+        // — any connected socket could send a challenge that appears to
+        // come from any other student. Now bound to the verified identity
+        // set by the io.use() JWT middleware in server.js.
+        const challengerId = socket.data.studentId;
+        if (!challengerId) return cb?.({ success: false, error: 'Not authenticated.' });
+
         // Check they're friends
         const [a, b] = [challengerId, targetId].sort((x, y) => x - y);
         const areFriends = await db.query(
@@ -120,8 +127,16 @@ function initLiveChallenges(io) {
     });
 
     // ── ACCEPT CHALLENGE ─────────────────────────────────
-    socket.on('challenge:accept', async ({ challengeId, accepterId }, cb) => {
+    socket.on('challenge:accept', async ({ challengeId }, cb) => {
       try {
+        // FIX: accepterId used to come from the client payload — any
+        // socket could force-accept a challenge on behalf of the actual
+        // target (or anyone else), starting a real-money-rewarding match
+        // that the impersonated student never agreed to. Now bound to the
+        // verified identity from the JWT middleware.
+        const accepterId = socket.data.studentId;
+        if (!accepterId) return cb?.({ success: false, error: 'Not authenticated.' });
+
         const challenge = pendingChallenges.get(challengeId);
         if (!challenge || challenge.status !== 'pending') {
           return cb?.({ success: false, error: 'Challenge not found or expired.' });
@@ -174,9 +189,17 @@ function initLiveChallenges(io) {
     });
 
     // ── DECLINE CHALLENGE ────────────────────────────────
-    socket.on('challenge:decline', ({ challengeId, declinerId }) => {
+    socket.on('challenge:decline', ({ challengeId }) => {
+      // FIX: same identity-binding issue as accept — a decline used to be
+      // acceptable from any socket regardless of whether it was actually
+      // the challenge's target declining. Low-stakes compared to
+      // accept/answer (declining doesn't award anything), but still
+      // closed for consistency, and to stop a third party from silently
+      // killing someone else's incoming challenge.
+      const declinerId = socket.data.studentId;
       const challenge = pendingChallenges.get(challengeId);
       if (!challenge || challenge.status !== 'pending') return;
+      if (!declinerId || challenge.targetId !== declinerId) return;
       challenge.status = 'declined';
       pendingChallenges.delete(challengeId);
 
@@ -187,12 +210,20 @@ function initLiveChallenges(io) {
     });
 
     // ── ANSWER IN LIVE MATCH ─────────────────────────────
-    socket.on('challenge:answer', ({ matchId, playerId, choice }, cb) => {
+    socket.on('challenge:answer', ({ matchId, choice }, cb) => {
+      // FIX: playerId used to come from the client payload — any socket
+      // could submit answers on behalf of either player in ANY active
+      // match anywhere on the server (matchId is guessable/enumerable,
+      // being a timestamp + short random suffix), directly manipulating
+      // who wins real coin rewards. Now bound to the verified identity.
+      const playerId = socket.data.studentId;
+      if (!playerId) return cb?.({ success: false });
+
       const match = activeMatches.get(matchId);
       if (!match || match.status !== 'active') return cb?.({ success: false });
 
       const player = match.players.get(playerId);
-      if (!player) return cb?.({ success: false });
+      if (!player) return cb?.({ success: false }); // playerId isn't actually in this match
 
       if (player.answers[match.currentQ] !== undefined) return cb?.({ success: false }); // already answered
 

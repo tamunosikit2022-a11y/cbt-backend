@@ -167,12 +167,16 @@ async function applyChestRewards(studentId, rewards) {
     }
     else if (r.type === 'boost') {
       boosts.push(r.value);
+      // FIX: was inserting into student_skills — a table skillsController
+      // has no effect logic for these skill_ids ('double_xp',
+      // 'coin_magnet', etc.), so the reward was permanently inert. Write
+      // into student_boosts instead (same table spinController/
+      // seasonCosmeticsController use), with a real 24h expiry, so
+      // src/utils/boosts.js can actually find and apply it.
       await db.query(
-        `INSERT INTO student_skills (student_id, skill_id, quantity)
-         VALUES ($1,$2,1)
-         ON CONFLICT (student_id, skill_id) DO UPDATE
-           SET quantity = student_skills.quantity + 1`,
-        [studentId, r.value]
+        `INSERT INTO student_boosts (student_id, boost_type, multiplier, expires_at)
+         VALUES ($1,$2,$3,NOW()+INTERVAL '24 hours')`,
+        [studentId, r.value, 2.0]
       ).catch(() => {});
     }
     else if (r.type === 'spin') {
@@ -235,20 +239,28 @@ exports.openChest = async (req, res) => {
     const io      = req.app.get('io');
     const chestId = parseInt(req.params.id);
 
-    const chest = await db.query(
-      `SELECT * FROM student_chests WHERE id=$1 AND student_id=$2 AND opened=false`,
+    // FIX: was SELECT ...WHERE opened=false, then a separate UPDATE — not
+    // atomic, so two concurrent requests (double-tap, retry-on-slow-
+    // network, or a scripted duplicate) could both pass the SELECT before
+    // either UPDATE landed, opening the same chest twice and double-
+    // crediting its rewards. Claim it atomically in one statement instead
+    // (same pattern tokenController.verifyPayment already uses correctly
+    // for the same class of problem) — whichever request's UPDATE lands
+    // first "wins" the chest; the other gets rows.length===0 and a clean
+    // 404 rather than a second payout.
+    const claimed = await db.query(
+      `UPDATE student_chests SET opened=true, opened_at=NOW()
+       WHERE id=$1 AND student_id=$2 AND opened=false
+       RETURNING *`,
       [chestId, sid]
-    ).then(r => r.rows[0]);
-    if (!chest) return res.status(404).json({ error: 'Chest not found or already opened.' });
+    );
+    if (!claimed.rows.length) return res.status(404).json({ error: 'Chest not found or already opened.' });
+    const chest = claimed.rows[0];
 
     // Roll rewards
     const result = rollChest(chest.tier);
 
-    // Mark as opened
-    await db.query(
-      `UPDATE student_chests SET opened=true, opened_at=NOW(), rewards_json=$1 WHERE id=$2`,
-      [JSON.stringify(result.rewards), chestId]
-    );
+    await db.query(`UPDATE student_chests SET rewards_json=$1 WHERE id=$2`, [JSON.stringify(result.rewards), chestId]);
 
     // Apply rewards to student account
     const totals = await applyChestRewards(sid, result.rewards);
@@ -273,15 +285,6 @@ exports.claimDailyChest = async (req, res) => {
   try {
     const sid = req.student.id;
 
-    // Check if already claimed today
-    const alreadyClaimed = await db.query(
-      `SELECT id FROM student_chests
-       WHERE student_id=$1 AND source='daily' AND earned_at::date = CURRENT_DATE`,
-      [sid]
-    ).then(r => r.rows.length > 0).catch(() => false);
-
-    if (alreadyClaimed) return res.status(400).json({ error: 'Daily chest already claimed.' });
-
     // Get streak to determine chest tier
     const streakRow = await db.query(
       `SELECT COALESCE(current_streak,0) as streak FROM streaks WHERE student_id=$1`, [sid]
@@ -289,11 +292,32 @@ exports.claimDailyChest = async (req, res) => {
     const streak = parseInt(streakRow.rows[0]?.streak || 0);
     const tier   = chestForStreak(streak);
 
-    // Insert chest then immediately open it so rewards apply on claim
+    // FIX: was a separate "already claimed today?" SELECT before the
+    // INSERT — not atomic, same race as openChest above (two concurrent
+    // claim-daily requests could both pass the check and insert two daily
+    // chests, double-paying the daily reward). daily_claim_key gives
+    // Postgres itself something to enforce uniqueness on: one value per
+    // student per calendar day, so a concurrent duplicate INSERT fails
+    // the UNIQUE constraint instead of silently succeeding twice — no
+    // read-then-write gap for a second request to land in.
     const inserted = await db.query(
-      `INSERT INTO student_chests (student_id, tier, source) VALUES ($1,$2,'daily') RETURNING id`,
+      `INSERT INTO student_chests (student_id, tier, source, daily_claim_key)
+       VALUES ($1,$2,'daily', $1::text || ':' || CURRENT_DATE)
+       ON CONFLICT (daily_claim_key) WHERE daily_claim_key IS NOT NULL DO NOTHING
+       RETURNING id`,
       [sid, tier]
-    );
+    ).catch(async (err) => {
+      if (err.code === '42703' /* undefined_column: migration not run yet */) {
+        // Fall back to the old (racy, but functional) check for
+        // environments that haven't migrated yet — never block the
+        // whole daily-chest feature over a missing column.
+        console.warn('[treasureChest] daily_claim_key column missing — run `npm run migrate`. Daily-claim race is unguarded until then.');
+        return db.query(`INSERT INTO student_chests (student_id, tier, source) VALUES ($1,$2,'daily') RETURNING id`, [sid, tier]);
+      }
+      throw err;
+    });
+
+    if (!inserted.rows.length) return res.status(400).json({ error: 'Daily chest already claimed.' });
     const chestId = inserted.rows[0].id;
 
     // Roll & apply rewards immediately

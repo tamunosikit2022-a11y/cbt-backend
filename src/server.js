@@ -5,6 +5,7 @@ const { Server }   = require("socket.io");
 const compression  = require("compression");
 const helmet       = require("helmet");
 const cookieParser = require("cookie-parser");
+const jwt          = require("jsonwebtoken");
 const cron         = require("node-cron");
 require("dotenv").config();
 
@@ -77,6 +78,50 @@ const io = new Server(server, {
   allowEIO3:      true,
   maxHttpBufferSize: 1e6,  // 1MB max message size
   connectTimeout: 10000,
+});
+
+// FIX: there was no socket-level authentication anywhere in this
+// codebase — every socket handler across every feature trusted whatever
+// id (challengerId, playerId, student_id, etc.) the client happened to
+// put in its payload, with zero verification that the connected socket
+// actually belonged to that student. Concretely, in liveChallengeController.js
+// this meant any connected client could impersonate any other student:
+// force-accept a challenge on someone else's behalf, submit quiz answers
+// as another player, or send challenges that appear to come from someone
+// else — coins/wins/losses all follow the (unverified) id.
+//
+// The frontend already sends `auth: { token }` on this base-namespace
+// connection (see App.js's main socket connect) — it was just never read
+// server-side. This verifies it and exposes the real student id as
+// socket.data.studentId for any handler on this namespace to trust
+// instead of a client-supplied field.
+//
+// Deliberately non-blocking: does NOT reject the connection if no/invalid
+// token is present, only if verification succeeds does it set
+// socket.data.studentId. This is necessary because io.use() here applies
+// to the SAME server instance /arena and /classroom sub-namespaces are
+// created from, and those two don't send a token at all yet — a hard
+// rejection here would break them outright. socket.data.studentId being
+// unset is what individual handlers (e.g. liveChallengeController below)
+// check to refuse an identity-sensitive action, rather than the
+// connection itself being refused. /arena and /classroom still need their
+// own equivalent fix (send a token from their frontend socket files too,
+// then verify it) — not done here since that requires reviewing each of
+// those frontend connection files and their full handler set first,
+// which is a separate piece of work.
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (token) {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      socket.data.studentId = decoded.id;
+    }
+  } catch (err) {
+    // Invalid/expired token — leave socket.data.studentId unset rather
+    // than rejecting the connection (see comment above); handlers that
+    // require verified identity will refuse the action themselves.
+  }
+  next();
 });
 
 // ── MIDDLEWARE ────────────────────────────────────────────
@@ -390,6 +435,21 @@ server.listen(PORT, "0.0.0.0", () => {
       }
       console.log(`🧠 Rebuilt profiles for ${rows.length} active students`);
     } catch (err) { console.error("Nightly profile batch failed:", err.message); }
+  });
+
+  // ── NIGHTLY AI TUTOR NOTE EXTRACTION — 02:20, offset from the behaviour
+  // profile batch above so the two don't compete for DB/AI-provider
+  // throughput at the exact same minute. Distills recently-active chat
+  // sessions into short standing facts (see extractSessionNotes in
+  // aiTutorController.js) so ScholarAI has memory across sessions, not
+  // just within the current one.
+  cron.schedule("20 2 * * *", async () => {
+    console.log("💬 Running nightly AI tutor note extraction...");
+    try {
+      const { runNightlyNoteExtraction } = require("./controllers/aiTutorController");
+      const result = await runNightlyNoteExtraction();
+      console.log(`💬 Note extraction: ${result.ok}/${result.processed} sessions processed (${result.failed} failed)`);
+    } catch (err) { console.error("Nightly note extraction failed:", err.message); }
   });
 });
 

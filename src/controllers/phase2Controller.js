@@ -103,14 +103,29 @@ exports.addToSpacedRep = async (req, res) => {
   const { question_ids } = req.body;
   const student_id = req.student.id;
 
+  // FIX: this looped over question_ids running one INSERT round-trip per
+  // item, with no validation that it was even an array and no cap on
+  // size — a client sending a huge array (accidentally, from a buggy
+  // client, or deliberately) could tie up a DB connection for a long
+  // time doing hundreds/thousands of sequential inserts one at a time.
+  // Same batch-size discipline examController.submitExam already applies
+  // elsewhere in this codebase (capped at 250), now applied here too,
+  // plus doing it as ONE batched INSERT via UNNEST instead of N
+  // round-trips — faster and removes the unbounded-loop risk entirely.
+  if (!Array.isArray(question_ids) || !question_ids.length) {
+    return res.status(400).json({ error: "question_ids must be a non-empty array." });
+  }
+  const ids = [...new Set(question_ids)].slice(0, 250).map(id => parseInt(id)).filter(Number.isInteger);
+  if (!ids.length) return res.status(400).json({ error: "No valid question IDs provided." });
+
   try {
-    for (const qid of question_ids) {
-      await db.query(
-        `INSERT INTO spaced_repetition (student_id, question_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-        [student_id, qid]
-      );
-    }
-    res.json({ success: true, added: question_ids.length });
+    await db.query(
+      `INSERT INTO spaced_repetition (student_id, question_id)
+       SELECT $1, unnest($2::int[])
+       ON CONFLICT DO NOTHING`,
+      [student_id, ids]
+    );
+    res.json({ success: true, added: ids.length });
   } catch (err) {
     serverError(res, err);
   }
@@ -149,11 +164,18 @@ exports.getPersonalityProfile = async (req, res) => {
          ORDER BY completed_at DESC LIMIT 20`,
         [student_id]
       ),
+      // FIX: no ORDER BY before LIMIT 200 means Postgres doesn't
+      // guarantee which 200 rows come back — the "average speed"
+      // calculated from this sample could shift between identical calls,
+      // or arbitrarily skew toward old activity rather than the
+      // student's current pace. Ordering by session recency makes the
+      // sample actually mean "their most recent up-to-200 answers".
       db.query(
         `SELECT ea.time_spent_seconds, ea.is_correct
          FROM exam_answers ea
          JOIN exam_sessions es ON es.id = ea.session_id
          WHERE es.student_id = $1 AND ea.time_spent_seconds > 0
+         ORDER BY es.completed_at DESC
          LIMIT 200`,
         [student_id]
       ),

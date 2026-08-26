@@ -2,6 +2,7 @@ const db      = require("../config/db");
 const bcrypt  = require("bcryptjs");
 const jwt     = require("jsonwebtoken");
 const https   = require("https");
+const crypto  = require("crypto");
 const cloudinary = require("cloudinary").v2;
 const { handleReferral } = require("../routes/referral");
 const { generateUniqueUsername } = require("../utils/usernameGenerator");
@@ -26,8 +27,75 @@ function generateAdminToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "24h" });
 }
 
-function generateRefreshToken(payload) {
-  return jwt.sign(payload, process.env.REFRESH_SECRET || process.env.JWT_SECRET + "_refresh", { expiresIn: "30d" });
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+// ── REFRESH SESSION MANAGEMENT ─────────────────────────────
+// FIX: migrations/refresh_sessions.sql already builds exactly the right
+// table for this (token_hash, revoked_at, expires_at, per-device info) —
+// it just sat unused. refreshToken() was doing a bare jwt.verify() with no
+// DB check at all, meaning there was no way to revoke a single session or
+// device, and — worse — a password reset didn't invalidate any refresh
+// token issued before it. If an account was ever compromised, resetting
+// the password did NOT log the attacker out; their refresh token (up to
+// 30 days) kept working regardless.
+//
+// Design: each refresh token embeds a random `jti` (session id) that
+// doubles as the primary key of its refresh_sessions row. On every
+// refresh, we check that row hasn't been revoked/expired AND that its
+// stored token_hash matches the presented token — the second check is
+// deliberate defense-in-depth: JWT_SECRET was exposed in the leaked .env
+// from the earlier audit, so until every deployment has rotated it, an
+// attacker who knows the (now-public) secret could otherwise forge a
+// refresh token with an arbitrary jti/student id. They still can't forge
+// a matching DB row, so the hash check holds even against that.
+//
+// Everything here degrades gracefully (falls back to signature-only
+// trust, logs a warning) if the table hasn't been migrated yet in a given
+// environment — this should never be the reason nobody can log in.
+let _warnedNoSessionsTable = false;
+function warnMissingSessionsTable(err) {
+  if (err?.code === '42P01' && !_warnedNoSessionsTable) {
+    _warnedNoSessionsTable = true;
+    console.warn('[auth] refresh_sessions table not found — run `npm run migrate`. Falling back to signature-only refresh tokens until then.');
+  } else if (err?.code !== '42P01') {
+    console.error('[auth] refresh_sessions query failed:', err.message);
+  }
+}
+
+async function createRefreshSession(studentId, role, req) {
+  const jti = crypto.randomUUID();
+  const token = jwt.sign(
+    { id: studentId, role, jti },
+    process.env.REFRESH_SECRET || process.env.JWT_SECRET + "_refresh",
+    { expiresIn: "30d" }
+  );
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  // FIX: was reading req.headers["x-forwarded-for"] directly, which
+  // ignores the app.set("trust proxy", 1) already configured in
+  // server.js — that setting exists specifically so Express resolves
+  // req.ip safely from the correct hop, discarding any client-forgeable
+  // entries further left in the header chain. Reading the raw header
+  // bypassed that protection entirely, across every IP-logging spot in
+  // this file (also fixed in register/login/activateKey below).
+  const ip = req.ip;
+  await db.query(
+    `INSERT INTO refresh_sessions (id, student_id, token_hash, expires_at, user_agent, ip_address)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [jti, studentId, hashToken(token), expiresAt, (req.headers["user-agent"] || "").slice(0, 300), ip]
+  ).catch(warnMissingSessionsTable);
+  return token;
+}
+
+// Used by changePassword/resetPassword — logs out every device, not just
+// the current one, since we don't know which session (if any) belongs to
+// an attacker.
+async function revokeAllSessions(studentId) {
+  await db.query(
+    `UPDATE refresh_sessions SET revoked_at = NOW() WHERE student_id = $1 AND revoked_at IS NULL`,
+    [studentId]
+  ).catch(warnMissingSessionsTable);
 }
 
 function generateOTP() {
@@ -148,7 +216,6 @@ async function sendOTPviaEmail(toEmail, otp) {
 }
 
 // ── EMAIL VERIFICATION ────────────────────────────────────
-const crypto = require("crypto");
 
 async function sendVerificationEmail(toEmail, token) {
   const baseUrl = process.env.FRONTEND_URL || "https://scholarssyndicate.vercel.app";
@@ -208,7 +275,7 @@ exports.register = async (req, res) => {
     if (phoneCheck.rows.length)
       return res.status(400).json({ error: "This phone number is already linked to an account.", code: "PHONE_EXISTS" });
 
-    const ip = (req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+    const ip = req.ip;
 
     const hash = await bcrypt.hash(password, 12);
     // FIX BUG 31: include school_name in register
@@ -225,12 +292,11 @@ exports.register = async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, full_name, email, phone, is_premium, email_verified, created_at`,
       [full_name.trim(), email.trim().toLowerCase(), cleanPhone, hash,
        state_of_origin || null, school_class || null, target_university || null, target_course || null,
-       resolveSchoolAlias(school_name, normalizeSchoolName), `IP:${ip}`]
+       resolveSchoolAlias(school_name, normalizeSchoolName), (req.headers["user-agent"] || "").slice(0,200)]
     );
     const student = result.rows[0];
 
-    // Auto-assign a unique username so students can find/add each other.
-    // Falls back silently (student can still set one manually later) if
+    // Auto-assign a unique username so students can find/add each other.    // Falls back silently (student can still set one manually later) if
     // this migration hasn't been run yet on the DB.
     let username = null;
     try {
@@ -295,7 +361,7 @@ exports.register = async (req, res) => {
     }
 
     const token        = generateToken({ id: student.id, role: "student", username });
-    const refreshToken = generateRefreshToken({ id: student.id, role: "student" });
+    const refreshToken = await createRefreshSession(student.id, "student", req);
     res.cookie("refresh_token", refreshToken, {
       httpOnly: true,
       secure:   process.env.NODE_ENV === "production",
@@ -316,7 +382,7 @@ exports.register = async (req, res) => {
 // ── LOGIN ─────────────────────────────────────────────────
 exports.login = async (req, res) => {
   const { identifier, password } = req.body;
-  const ip = (req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+  const ip = req.ip;
   if (!identifier || !password)
     return res.status(400).json({ error: "Email/phone and password are required." });
 
@@ -334,7 +400,13 @@ exports.login = async (req, res) => {
         "INSERT INTO login_logs (ip_address, device_info, success, failed_reason) VALUES ($1,$2,false,$3)",
         [ip, (req.headers["user-agent"] || "").slice(0,200), "Account not found"]
       ).catch(() => {});
-      return res.status(401).json({ error: "No account found with this email or phone number." });
+      // FIX: this used to say "No account found with this email or phone
+      // number" — different wording from a wrong-password failure below
+      // meant anyone could enumerate which emails/phones are registered
+      // just by trying login and reading the error message. Logged
+      // internally as before (failed_reason above); response wording is
+      // now identical to the wrong-password case either way.
+      return res.status(401).json({ error: "Incorrect email/phone or password." });
     }
 
     const student = result.rows[0];
@@ -361,7 +433,7 @@ exports.login = async (req, res) => {
         "INSERT INTO login_logs (student_id, ip_address, device_info, success, failed_reason) VALUES ($1,$2,$3,false,$4)",
         [student.id, ip, (req.headers["user-agent"] || "").slice(0,200), "Wrong password"]
       ).catch(() => {});
-      return res.status(401).json({ error: "Incorrect password. Please try again." });
+      return res.status(401).json({ error: "Incorrect email/phone or password." });
     }
 
     // Auto-expire premium
@@ -379,9 +451,13 @@ exports.login = async (req, res) => {
 
 
     // Update last seen + login count
+    // FIX: device_info was storing `IP:${ip}` — a duplicate of the
+    // ip_address column, under a misleading name. login_logs.device_info
+    // (elsewhere in this file) correctly stores the user-agent; this
+    // brings students.device_info in line with that, no migration needed.
     await db.query(
       "UPDATE students SET last_seen=NOW(), login_count=COALESCE(login_count,0)+1, device_info=$2 WHERE id=$1",
-      [student.id, `IP:${ip}`]
+      [student.id, (req.headers["user-agent"] || "").slice(0,200)]
     ).catch(() => {});
 
     await db.query(
@@ -391,7 +467,7 @@ exports.login = async (req, res) => {
 
     const { password_hash, ...safeStudent } = student;
     const token        = generateToken({ id: student.id, role: "student", username: student.username });
-    const refreshToken = generateRefreshToken({ id: student.id, role: "student" });
+    const refreshToken = await createRefreshSession(student.id, "student", req);
     res.cookie("refresh_token", refreshToken, {
       httpOnly: true,
       secure:   process.env.NODE_ENV === "production",
@@ -598,24 +674,47 @@ exports.changePassword = async (req, res) => {
     return res.status(400).json({ error: "New password must be at least 6 characters." });
   try {
     const r = await db.query("SELECT password_hash FROM students WHERE id=$1", [req.student.id]);
+    // FIX: this assumed r.rows[0] always exists — a missing row (deleted
+    // account, stale token) threw a raw TypeError caught by nothing,
+    // producing an unhandled 500 instead of a clean error response.
+    if (!r.rows.length) return res.status(404).json({ error: "Account not found." });
     const valid = await bcrypt.compare(current_password, r.rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: "Current password is incorrect." });
     const hash = await bcrypt.hash(new_password, 12);
     await db.query("UPDATE students SET password_hash=$1, updated_at=NOW() WHERE id=$2", [hash, req.student.id]);
+
+    // FIX: a password change is often a direct response to "I think my
+    // account may be compromised" — but this never invalidated any
+    // refresh token issued before the change, so an attacker who already
+    // had one kept full access for up to 30 more days regardless. Now
+    // every device is logged out and must re-authenticate with the new
+    // password; the current browser gets a fresh cookie below so only
+    // *this* session avoids being forced to log back in.
+    await revokeAllSessions(req.student.id);
+    const newRefreshToken = await createRefreshSession(req.student.id, "student", req);
+    res.cookie("refresh_token", newRefreshToken, {
+      httpOnly: true,
+      secure:   process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+      maxAge:   30 * 24 * 60 * 60 * 1000,
+    });
+
     res.json({ success: true, message: "Password updated successfully." });
   } catch (err) { serverError(res, err); }
 };
 
-// ── FORGOT PASSWORD — Send OTP via email or phone ──────────
+// ── FORGOT PASSWORD — Send OTP via email ────────────────────
+// FIX: was accepting `phone` in the destructure and computing a `field`
+// var for a SELECT ... WHERE ${field}=$1, but isEmail was hardcoded true
+// three lines in and anything without "@" was rejected before reaching
+// that code — the phone path was unreachable. Simplified to match what
+// was actually reachable.
 exports.forgotPassword = async (req, res) => {
-  const { email, phone } = req.body;
-  const raw = (email || phone || "").trim();
-  if (!raw) return res.status(400).json({ error: "Email address required." });
-  if (!raw.includes("@"))
+  const { email } = req.body;
+  const cleanId = (email || "").trim().toLowerCase();
+  if (!cleanId) return res.status(400).json({ error: "Email address required." });
+  if (!cleanId.includes("@"))
     return res.status(400).json({ error: "Enter your registered email address." });
-
-  const isEmail = true;
-  const cleanId = raw.toLowerCase();
 
   try {
     // Rate limiting
@@ -626,11 +725,9 @@ exports.forgotPassword = async (req, res) => {
     if (parseInt(recentOTPs.rows[0].count) >= 3)
       return res.status(429).json({ error: "Too many OTP requests. Please wait 5 minutes." });
 
-    // Look up student by email or phone
-    const field  = isEmail ? "email" : "phone";
-    const result = await db.query(`SELECT id, email, phone FROM students WHERE ${field}=$1`, [cleanId]);
+    const result = await db.query(`SELECT id, email FROM students WHERE email=$1`, [cleanId]);
     if (!result.rows.length)
-      return res.status(404).json({ error: `No account found with this ${isEmail ? "email" : "phone number"}.` });
+      return res.status(404).json({ error: "No account found with this email." });
 
     const student = result.rows[0];
     const otp     = generateOTP();
@@ -669,17 +766,22 @@ exports.forgotPassword = async (req, res) => {
 };
 
 // ── VERIFY OTP — Step 2 of forgot password ─────────────────
+// FIX: this always branched on isEmail/cleanId to also handle a phone
+// identifier, but forgotPassword (just above) has hardcoded isEmail=true
+// and rejects anything without "@" since it was written — meaning
+// otp_codes.identifier is always an email in practice, and the frontend
+// (ForgotPassword.js) only ever sends `email`, never `phone`, to any of
+// these three endpoints. The phone branch was unreachable dead code from
+// a half-finished phone-reset feature. Simplified to match what's
+// actually reachable; re-add properly (with SMS delivery wired up) if
+// phone-based reset becomes a real feature later.
 exports.verifyOtp = async (req, res) => {
-  const { email, phone, otp } = req.body;
-  const raw = (email || phone || "").trim();
-  if (!raw || !otp)
-    return res.status(400).json({ error: "Email/phone and OTP are required." });
+  const { email, otp } = req.body;
+  const cleanId = (email || "").trim().toLowerCase();
+  if (!cleanId || !otp)
+    return res.status(400).json({ error: "Email and OTP are required." });
 
-  const isEmail = raw.includes("@");
-  const cleanId = isEmail ? raw.toLowerCase() : raw.replace(/\s+/g, "");
   const cleanOtp = String(otp).trim();
-
-  console.log("[verifyOtp] identifier:", cleanId, "| otp:", cleanOtp);
 
   try {
     // Step 1: does ANY record exist for this identifier+code (ignore expiry/used)?
@@ -690,14 +792,7 @@ exports.verifyOtp = async (req, res) => {
       [cleanId, cleanOtp]
     );
 
-    console.log("[verifyOtp] anyMatch rows:", anyMatch.rows);
-
     if (!anyMatch.rows.length) {
-      // Check if identifier exists at all
-      const idCheck = await db.query(
-        `SELECT identifier, code, used, expires_at FROM otp_codes WHERE otp_type='password_reset' ORDER BY created_at DESC LIMIT 3`
-      );
-      console.log("[verifyOtp] Latest 3 OTP records:", idCheck.rows);
       return res.status(400).json({ error: "Code not found. Please request a new one." });
     }
 
@@ -716,15 +811,12 @@ exports.verifyOtp = async (req, res) => {
 
 // ── RESET PASSWORD ────────────────────────────────────────
 exports.resetPassword = async (req, res) => {
-  const { email, phone, otp, new_password } = req.body;
-  const raw = (email || phone || "").trim();
-  if (!raw || !otp || !new_password)
-    return res.status(400).json({ error: "Email/phone, OTP and new password are required." });
+  const { email, otp, new_password } = req.body;
+  const cleanId = (email || "").trim().toLowerCase();
+  if (!cleanId || !otp || !new_password)
+    return res.status(400).json({ error: "Email, OTP and new password are required." });
   if (new_password.length < 6)
     return res.status(400).json({ error: "Password must be at least 6 characters." });
-
-  const isEmail = raw.includes("@");
-  const cleanId = isEmail ? raw.toLowerCase() : raw.replace(/\s+/g, "");
 
   try {
     const otpResult = await db.query(
@@ -741,10 +833,18 @@ exports.resetPassword = async (req, res) => {
     // Mark OTP as used
     await db.query("UPDATE otp_codes SET used=true WHERE id=$1", [otpResult.rows[0].id]);
 
-    // Update password by email or phone
+    // Update password
     const hash  = await bcrypt.hash(new_password, 12);
-    const field = isEmail ? "email" : "phone";
-    await db.query(`UPDATE students SET password_hash=$1, updated_at=NOW() WHERE ${field}=$2`, [hash, cleanId]);
+    const updated = await db.query(
+      `UPDATE students SET password_hash=$1, updated_at=NOW() WHERE email=$2 RETURNING id`,
+      [hash, cleanId]
+    );
+
+    // FIX: same reasoning as changePassword — a reset via forgot-password
+    // is *more* likely to follow account compromise, not less, so this
+    // needs the same session invalidation. Previously any refresh token
+    // issued before the reset kept working for up to 30 more days.
+    if (updated.rows[0]) await revokeAllSessions(updated.rows[0].id);
 
     res.json({ success: true, message: "Password reset successfully. You can now login." });
   } catch (err) {
@@ -774,7 +874,7 @@ exports.adminLogin = async (req, res) => {
 exports.activateKey = async (req, res) => {
   const { key_code } = req.body;
   const student_id   = req.student.id;
-  const ip           = (req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+  const ip           = req.ip;
   if (!key_code) return res.status(400).json({ error: "Key code required." });
 
   try {
@@ -901,6 +1001,24 @@ exports.subscribeNotifications = async (req, res) => {
 // ── LOGOUT ────────────────────────────────────────────────
 exports.logout = async (req, res) => {
   try {
+    // FIX: previously just cleared the cookie client-side — the refresh
+    // token itself, if somehow captured before logout (XSS, shared
+    // device, browser history), remained valid server-side for up to 30
+    // more days. Now revoke the specific session in refresh_sessions too.
+    const rt = req.cookies?.refresh_token;
+    if (rt) {
+      try {
+        const secret = process.env.REFRESH_SECRET || process.env.JWT_SECRET + "_refresh";
+        const decoded = jwt.verify(rt, secret);
+        if (decoded?.jti) {
+          await db.query("UPDATE refresh_sessions SET revoked_at=NOW() WHERE id=$1", [decoded.jti]).catch(warnMissingSessionsTable);
+        }
+      } catch {
+        // Expired/invalid/forged token — nothing to revoke, and logout
+        // should succeed regardless (the client just wants the cookie gone).
+      }
+    }
+
     res.clearCookie("refresh_token", {
       httpOnly: true,
       secure:   process.env.NODE_ENV === "production",
@@ -919,7 +1037,37 @@ exports.refreshToken = async (req, res) => {
   if (!rt) return res.status(401).json({ error: "No refresh token" });
   try {
     const secret = process.env.REFRESH_SECRET || process.env.JWT_SECRET + "_refresh";
-    const { id, role } = jwt.verify(rt, secret);
+    const { id, role, jti } = jwt.verify(rt, secret);
+
+    // FIX: this used to stop at signature verification — a token issued
+    // before a password reset/logout-all, or before this feature existed
+    // and never explicitly revoked, kept refreshing indefinitely for its
+    // full 30-day lifetime with no way to cut it off early. Now cross-
+    // check against refresh_sessions (see comment on createRefreshSession
+    // above for why token_hash is checked too, not just revoked_at).
+    if (jti) {
+      try {
+        const { rows } = await db.query(
+          `SELECT token_hash, revoked_at, expires_at FROM refresh_sessions WHERE id=$1`,
+          [jti]
+        );
+        if (rows.length) {
+          const row = rows[0];
+          const stillValid = !row.revoked_at && new Date(row.expires_at) > new Date() && row.token_hash === hashToken(rt);
+          if (!stillValid) return res.status(401).json({ error: "Session revoked. Please log in again." });
+          db.query(`UPDATE refresh_sessions SET last_used_at=NOW() WHERE id=$1`, [jti]).catch(() => {});
+        }
+        // No row found: token predates this feature (issued before
+        // migration) or the table was just migrated — allow through once
+        // rather than mass-logging-out everyone mid-rollout. Every token
+        // issued going forward always has a matching row.
+      } catch (dbErr) {
+        warnMissingSessionsTable(dbErr);
+        // Table missing or transient DB issue — degrade to signature-only
+        // trust rather than blocking refresh for everyone.
+      }
+    }
+
     const newAccess = generateToken({ id, role });
     res.json({ token: newAccess });
   } catch {

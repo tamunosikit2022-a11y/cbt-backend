@@ -150,10 +150,22 @@ exports.claimMission = async (req, res) => {
     const claimDate = sm.rows[0].type === "weekly"
       ? sm.rows[0].date  // use the actual date stored in the row
       : today;
-    await db.query(
-      `UPDATE student_missions SET claimed=true WHERE student_id=$1 AND mission_code=$2 AND date=$3`,
+    // FIX: the check above (sm.rows[0].claimed) and this UPDATE are two
+    // separate round-trips — not atomic. Two concurrent claim requests
+    // (double-tap, retry-on-slow-network) could both read claimed=false
+    // before either UPDATE lands, both pass the check, and both go on to
+    // award XP/coins below — double-paying the same mission. Same class
+    // of race already fixed in treasureChestController.js's openChest/
+    // claimDailyChest; same fix here: make the UPDATE itself the atomic
+    // claim by including `AND claimed=false` and checking whether a row
+    // actually changed, instead of trusting a stale read from moments ago.
+    const claim = await db.query(
+      `UPDATE student_missions SET claimed=true
+       WHERE student_id=$1 AND mission_code=$2 AND date=$3 AND claimed=false
+       RETURNING id`,
       [student_id, mission_code, claimDate]
     );
+    if (!claim.rows.length) return res.status(400).json({ error: "Already claimed" });
 
     // Award XP + coins
     await db.query(

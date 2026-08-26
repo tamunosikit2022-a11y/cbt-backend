@@ -32,6 +32,19 @@ exports.otpLimiter = rateLimit({
   message:          msg("OTP", "5 minutes"),
 });
 
+// OTP verify: 10 attempts per 5 minutes per IP+identifier. Separate from
+// otpLimiter (which throttles *sending* codes) because a legit user may
+// mistype once or twice — but a 6-digit code is only ~1M combinations, so
+// this endpoint still needs a hard ceiling or it's brute-forceable.
+exports.otpVerifyLimiter = rateLimit({
+  windowMs:         5 * 60 * 1000,
+  max:              isProd ? 10 : 1000,
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  message:          msg("OTP verification", "5 minutes"),
+  keyGenerator:     (req) => `${req.ip}:${(req.body?.email || req.body?.phone || "").toLowerCase().trim()}`,
+});
+
 // Registration: 5 per hour per IP (prevents mass account creation)
 exports.registerLimiter = rateLimit({
   windowMs:         60 * 60 * 1000,
@@ -39,6 +52,18 @@ exports.registerLimiter = rateLimit({
   standardHeaders:  true,
   legacyHeaders:    false,
   message:          msg("registration", "1 hour"),
+});
+
+// Admin login: 5 attempts per 15 minutes per IP. Tighter than the student
+// loginLimiter (10/15min) since this credential controls the whole
+// platform — question banks, student data, payments — and previously had
+// NO rate limiting at all.
+exports.adminLoginLimiter = rateLimit({
+  windowMs:         15 * 60 * 1000,
+  max:              isProd ? 5 : 1000,
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  message:          msg("admin login", "15 minutes"),
 });
 
 // ── API LIMITERS ────────────────────────────────────────────

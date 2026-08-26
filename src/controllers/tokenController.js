@@ -4,8 +4,9 @@
  * Premium-to-token migration warnings via email.
  */
 
-const db    = require('../config/db');
-const https = require('https');
+const db      = require('../config/db');
+const https   = require('https');
+const crypto  = require('crypto');
 const { serverError } = require('../utils/errors');
 
 // ── Bundle definitions ─────────────────────────────────────
@@ -350,27 +351,100 @@ exports.TOKEN_COSTS = TOKEN_COSTS;
 
 
 // ── REWARD AD CREDIT ──────────────────────────────────────
-// POST /api/tokens/reward-ad
-// Called by the frontend after a student completes watching a reward ad.
-// Rate-limited to 5 times per day per student to prevent abuse.
+// FIX: this used to be a single POST /reward-ad call, trusted entirely —
+// the frontend's "watch a 30s ad" flow was just a client-side setInterval
+// before that one call, and the server had no way to distinguish a
+// legitimate wait from someone scripting the same request directly. Split
+// into start/complete: a session is created server-side with its own
+// started_at, and completion only credits tokens if the SERVER measures
+// at least ~25s having actually elapsed since that session started (not
+// merely trusts the client's claim that it did). The 5s grace below the
+// client's 30s timer absorbs normal network/clock variance without
+// meaningfully shortening the real wait. This isn't real ad-network
+// verification (no rewarded-video SDK is wired in yet — see
+// migrations/ad_reward_sessions.sql) but it closes the instant, zero-
+// effort, infinitely-scriptable version of the exploit.
+const TOKENS_PER_AD     = 5;
+const DAILY_AD_LIMIT    = 5;  // max 5 completions/day → 25 tokens/day
+const MIN_WATCH_SECONDS = 25; // must be ≥ this many real seconds since session start
+
+async function todaysAdCount(studentId) {
+  const today = new Date().toISOString().split("T")[0];
+  const r = await db.query(
+    `SELECT COUNT(*) FROM token_transactions
+     WHERE student_id=$1 AND type='reward_ad' AND created_at::date=$2::date`,
+    [studentId, today]
+  );
+  return parseInt(r.rows[0].count);
+}
+
+// POST /api/tokens/reward-ad/start
+exports.startRewardAdSession = async (req, res) => {
+  const student_id = req.student.id;
+  try {
+    const todayCount = await todaysAdCount(student_id);
+    if (todayCount >= DAILY_AD_LIMIT) {
+      return res.status(429).json({
+        error: `You've reached the daily limit of ${DAILY_AD_LIMIT} reward ads. Come back tomorrow!`
+      });
+    }
+
+    const sessionId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO ad_reward_sessions (id, student_id) VALUES ($1,$2)`,
+      [sessionId, student_id]
+    );
+    res.json({ session_id: sessionId, min_watch_seconds: MIN_WATCH_SECONDS });
+  } catch (err) {
+    if (err.code === '42P01') {
+      // Table not migrated yet — degrade to the old trust-the-client
+      // behavior rather than breaking the feature outright. Run
+      // `npm run migrate` to close this gap for real.
+      console.warn('[tokenController] ad_reward_sessions table missing — run `npm run migrate`. Reward ads are unverified until then.');
+      return res.json({ session_id: null, min_watch_seconds: MIN_WATCH_SECONDS });
+    }
+    serverError(res, err);
+  }
+};
+
+// POST /api/tokens/reward-ad/complete   body: { session_id }
 exports.rewardAdCredit = async (req, res) => {
   const student_id = req.student.id;
-  const TOKENS_PER_AD = 5;
-  const DAILY_LIMIT   = 5; // max 25 tokens/day from ads
+  const { session_id } = req.body;
 
   try {
-    // Check how many times they've earned ad tokens today
-    const today = new Date().toISOString().split("T")[0];
-    const countRes = await db.query(
-      `SELECT COUNT(*) FROM token_transactions
-       WHERE student_id=$1 AND type='reward_ad' AND created_at::date=$2::date`,
-      [student_id, today]
-    );
-    const todayCount = parseInt(countRes.rows[0].count);
-    if (todayCount >= DAILY_LIMIT) {
+    const todayCount = await todaysAdCount(student_id);
+    if (todayCount >= DAILY_AD_LIMIT) {
       return res.status(429).json({
-        error: `You've reached the daily limit of ${DAILY_LIMIT} reward ads. Come back tomorrow!`
+        error: `You've reached the daily limit of ${DAILY_AD_LIMIT} reward ads. Come back tomorrow!`
       });
+    }
+
+    // Verify the session: belongs to this student, not already completed,
+    // not expired, and enough real server-side time has actually passed.
+    if (session_id) {
+      const { rows } = await db.query(
+        `SELECT started_at, completed_at, expires_at, NOW() AS now
+         FROM ad_reward_sessions WHERE id=$1 AND student_id=$2`,
+        [session_id, student_id]
+      ).catch(err => {
+        if (err.code !== '42P01') throw err;
+        return { rows: [] }; // table missing — fall through to unverified path below
+      });
+
+      if (rows.length) {
+        const s = rows[0];
+        if (s.completed_at) return res.status(400).json({ error: "This reward has already been claimed." });
+        if (new Date(s.expires_at) < new Date(s.now)) return res.status(400).json({ error: "This ad session expired. Please try again." });
+        const elapsedSeconds = (new Date(s.now) - new Date(s.started_at)) / 1000;
+        if (elapsedSeconds < MIN_WATCH_SECONDS)
+          return res.status(400).json({ error: "Ad not finished yet." });
+
+        await db.query(`UPDATE ad_reward_sessions SET completed_at=NOW() WHERE id=$1`, [session_id]);
+      }
+      // No matching row (bad/forged session_id, or table missing when
+      // start ran): falls through unverified — same as the pre-fix
+      // behavior, bounded by the existing daily cap either way.
     }
 
     // Credit tokens
@@ -390,7 +464,7 @@ exports.rewardAdCredit = async (req, res) => {
       tokens_earned: TOKENS_PER_AD,
       new_balance:   bal.rows[0]?.token_balance ?? 0,
       ads_today:     todayCount + 1,
-      ads_remaining: DAILY_LIMIT - todayCount - 1,
+      ads_remaining: DAILY_AD_LIMIT - todayCount - 1,
     });
   } catch (err) {
     serverError(res, err);

@@ -5,6 +5,7 @@ const { containsBlockedContent } = require('../utils/profanityFilter');
 
 const FREE_DAILY_LIMIT    = 20;  // free daily messages before tokens required
 const PREMIUM_DAILY_LIMIT = 100;
+const MAX_NOTES_PER_STUDENT = 25; // cap so the context block injected into every prompt stays small and cheap
 
 const SYSTEM_PROMPT = `You are ScholarAI, the friendly AI tutor and guide inside Scholars Syndicate — a JAMB, Post-UTME, and CBT practice platform built for Nigerian students. You help students both with academic questions AND with navigating the app.
 
@@ -337,11 +338,193 @@ exports.getUsage = async (req, res) => {
   }
 };
 
+// ── PERSONALIZATION: ScholarAI already had chat persistence (sessions +
+// messages, above) — what it never had was any read access to the
+// behaviour profile the app already builds for every student.
+// behaviorController.buildProfile() runs after every exam submit and
+// nightly via cron (see server.js), and writes weak/strong subjects, most-
+// missed topics, and pacing (speedClass) to student_profiles. That data
+// just sat unused by the tutor. This pulls it into the system prompt on
+// every message so ScholarAI can reference a student's *actual* weak
+// topics and pace its explanations accordingly, instead of only knowing
+// what the student types in the current chat. Silently omitted for
+// students with no profile yet (new accounts, or before their first
+// completed exam) — nothing to personalize with yet, so don't confuse the
+// model with an empty block.
+async function buildStudentContextBlock(userId) {
+  const [profileBlock, notesBlock] = await Promise.all([
+    buildBehaviorProfileBlock(userId),
+    buildPastNotesBlock(userId),
+  ]);
+  return profileBlock + notesBlock;
+}
+
+async function buildBehaviorProfileBlock(userId) {
+  try {
+    const { rows } = await db.query(
+      'SELECT profile FROM student_profiles WHERE student_id = $1',
+      [userId]
+    );
+    const profile = rows[0]?.profile;
+    if (!profile) return '';
+
+    const { subjectTiers, weakTopics, speedClass } = profile;
+    const lines = [];
+
+    if (subjectTiers?.weak?.length)
+      lines.push(`- Weak subjects (accuracy < 40%): ${subjectTiers.weak.join(', ')}`);
+    if (subjectTiers?.medium?.length)
+      lines.push(`- Medium subjects: ${subjectTiers.medium.join(', ')}`);
+    if (subjectTiers?.strong?.length)
+      lines.push(`- Strong subjects (accuracy 70%+): ${subjectTiers.strong.join(', ')}`);
+    if (weakTopics?.length)
+      lines.push(`- Topics they repeatedly get wrong: ${weakTopics.slice(0, 5).map(t => `${t.topic} (${t.subject})`).join(', ')}`);
+    if (speedClass)
+      lines.push(`- Pace: answers questions ${speedClass === 'fast' ? 'very quickly — may be rushing, worth double-checking understanding' : speedClass === 'slow' ? 'slowly — may need more worked examples, be patient and thorough' : 'at a normal pace'}.`);
+
+    if (!lines.length) return '';
+
+    return `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧠 THIS STUDENT'S EXAM PROFILE (from their real exam history — use it to personalize, never recite it back verbatim or announce that you "have their data")\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`;
+  } catch (err) {
+    // Personalization is a nice-to-have, not a hard dependency — if this
+    // query fails, the tutor should still answer with the generic prompt
+    // rather than blocking the whole message.
+    console.error('buildBehaviorProfileBlock error:', err.message);
+    return '';
+  }
+}
+
+// ── CROSS-SESSION MEMORY ──────────────────────────────────────
+// The exam-profile block above is quantitative (scores, topics). This
+// covers what a student actually *said* in past chats — an exam date they
+// mentioned, a learning preference, a specific point of confusion — which
+// the profile has no way to capture. Notes are written by extractSessionNotes()
+// below, run by a nightly batch, not on every message (an extra AI call per
+// message would double cost and latency for something that doesn't change
+// turn-to-turn).
+async function buildPastNotesBlock(userId) {
+  try {
+    const { rows } = await db.query(
+      `SELECT note FROM ai_tutor_notes
+       WHERE student_id = $1 ORDER BY created_at DESC LIMIT ${MAX_NOTES_PER_STUDENT}`,
+      [userId]
+    );
+    if (!rows.length) return '';
+    return `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💬 THINGS LEARNED FROM PAST CONVERSATIONS (use naturally, don't announce you're recalling notes)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${rows.map(r => `- ${r.note}`).join('\n')}`;
+  } catch (err) {
+    console.error('buildPastNotesBlock error:', err.message);
+    return '';
+  }
+}
+
+// Distills a single session's messages into a handful of short standing
+// facts, and appends them to ai_tutor_notes. Idempotent per call site: the
+// nightly batch (below) only calls this for sessions whose messages have
+// changed since the last extraction (updated_at > notes_extracted_at), so
+// re-running the batch doesn't duplicate notes for an untouched session.
+async function extractSessionNotes(session) {
+  const { rows: messages } = await db.query(
+    `SELECT role, content FROM ai_tutor_messages
+     WHERE session_id = $1 ORDER BY created_at ASC LIMIT 40`,
+    [session.id]
+  );
+  // Nothing worth summarizing from a session that's just a greeting or two
+  if (messages.length < 4) {
+    await db.query('UPDATE ai_tutor_sessions SET notes_extracted_at = NOW() WHERE id = $1', [session.id]);
+    return;
+  }
+
+  const transcript = messages.map(m => `${m.role === 'user' ? 'Student' : 'ScholarAI'}: ${m.content}`).join('\n');
+
+  const EXTRACTION_PROMPT = `You are extracting durable facts worth remembering about a student, from one tutoring chat transcript. Output ONLY a JSON object: {"notes": ["...", "..."]}.
+
+Rules:
+- 0 to 3 short notes max. Empty array if nothing durable came up — most chats have nothing worth remembering, and that's fine.
+- Only include facts likely to still matter in a FUTURE, unrelated chat: stated exam dates/deadlines, a specific recurring point of confusion (name the topic), an explicitly stated learning preference (e.g. "prefers worked examples over theory"), or a stated goal (e.g. "aiming for 300+ in JAMB").
+- Never include: anything sensitive (health, family, emotional struggles, financial details), anything that was just answered and resolved in this chat with no reason to expect it recurs, or anything speculative you're inferring rather than something the student actually said or clearly demonstrated.
+- Each note under 20 words, written as a plain factual statement, not a quote.
+
+Transcript:
+${transcript}`;
+
+  try {
+    const { content } = await chatCompletion({
+      messages: [{ role: 'user', content: EXTRACTION_PROMPT }],
+      model: 'openai/gpt-oss-20b',
+      maxTokens: 300,
+      temperature: 0.2,
+      jsonMode: true,
+      taskType: 'quick',
+    });
+
+    let notes = [];
+    try {
+      notes = JSON.parse(content)?.notes || [];
+    } catch {
+      notes = []; // malformed JSON from the model — skip this session rather than crash the batch
+    }
+
+    for (const note of notes) {
+      if (typeof note === 'string' && note.trim() && note.length <= 300) {
+        // Same safety backstop used on tutor replies elsewhere in this file —
+        // a note gets shown to the student (and every future AI call) forever
+        // until pruned, so it goes through the same filter as a live reply.
+        if (containsBlockedContent(note)) continue;
+        await db.query(
+          `INSERT INTO ai_tutor_notes (student_id, session_id, note) VALUES ($1, $2, $3)`,
+          [session.user_id, session.id, note.trim()]
+        );
+      }
+    }
+
+    // Prune to the most recent MAX_NOTES_PER_STUDENT so the context block
+    // injected into every future prompt doesn't grow without bound.
+    await db.query(
+      `DELETE FROM ai_tutor_notes WHERE id IN (
+         SELECT id FROM ai_tutor_notes WHERE student_id = $1
+         ORDER BY created_at DESC OFFSET $2
+       )`,
+      [session.user_id, MAX_NOTES_PER_STUDENT]
+    );
+  } finally {
+    // Mark as extracted even on failure, so one bad/expensive session
+    // doesn't get retried every single night forever.
+    await db.query('UPDATE ai_tutor_sessions SET notes_extracted_at = NOW() WHERE id = $1', [session.id]);
+  }
+}
+
+// Called by the nightly cron in server.js. Finds sessions with new activity
+// since their last extraction (or never extracted) and processes each one.
+// Errors on an individual session are caught so one bad session can't stop
+// the batch for everyone else.
+async function runNightlyNoteExtraction() {
+  const { rows: sessions } = await db.query(
+    `SELECT id, user_id FROM ai_tutor_sessions
+     WHERE updated_at > NOW() - INTERVAL '26 hours'
+       AND (notes_extracted_at IS NULL OR notes_extracted_at < updated_at)
+     LIMIT 500`
+  );
+  let ok = 0, failed = 0;
+  for (const session of sessions) {
+    try {
+      await extractSessionNotes(session);
+      ok++;
+    } catch (err) {
+      failed++;
+      console.error(`extractSessionNotes failed for session ${session.id}:`, err.message);
+    }
+  }
+  return { processed: sessions.length, ok, failed };
+}
+exports.runNightlyNoteExtraction = runNightlyNoteExtraction;
+
 async function sendToGroqAndSave(sessionId, userId, isPremium, history, userMessage) {
   await checkAndIncrementUsage(userId, isPremium);
 
+  const systemContent = SYSTEM_PROMPT + (await buildStudentContextBlock(userId));
+
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemContent },
     ...history.map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage },
   ];

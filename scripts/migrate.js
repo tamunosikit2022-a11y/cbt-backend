@@ -63,6 +63,31 @@ const ORDER = [
 
   // Content seed, independent of the above
   "university_questions_seed.sql",
+
+  // AI Tutor cross-session memory: adds a column to the existing
+  // ai_tutor_sessions table, so it must run after missing_tables.sql
+  // (which creates that table).
+  "ai_tutor_notes.sql",
+
+  // Skill usage anti-cheat log: references exam_sessions and students, so
+  // must run after missing_tables.sql (both created there).
+  "skill_usage_log.sql",
+
+  // Ad-reward session verification: references students only.
+  "ad_reward_sessions.sql",
+
+  // Daily chest claim atomicity fix: adds a column to the existing
+  // student_chests table, so must run after innovation_tables.sql
+  // (which creates that table).
+  "daily_chest_claim_fix.sql",
+
+  // Friend request uniqueness: adds an index to the existing
+  // friend_requests table, so must run after innovation_tables.sql
+  // (which creates that table).
+  "friend_request_uniqueness.sql",
+
+  // Question reports: references students only.
+  "question_reports.sql",
 ];
 
 async function main() {

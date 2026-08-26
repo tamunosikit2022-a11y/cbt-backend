@@ -17,7 +17,10 @@ router.get('/verify/:reference',        token.verifyPayment);
 // Admin route — credit tokens after WhatsApp payment confirmed
 router.post('/admin/credit/:reference', requireAdmin, token.adminCreditTokens);
 
-// FIX: Reward ad token credit
-router.post('/reward-ad', requireStudent, token.rewardAdCredit);
+// FIX: reward-ad flow split into start/complete so the server can verify
+// real time elapsed instead of trusting the client entirely — see
+// tokenController.js for the full explanation.
+router.post('/reward-ad/start',    requireStudent, token.startRewardAdSession);
+router.post('/reward-ad',          requireStudent, token.rewardAdCredit);
 
 module.exports = router;

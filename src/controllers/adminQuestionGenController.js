@@ -80,6 +80,28 @@ function chunkText(text, size = 6000) {
 }
 
 // ── Groq → batch of questions ─────────────────────────────
+// FIX (likely root cause of "wrong questions allocated to wrong
+// answers" student complaints): this is the bulk PDF→questions pipeline
+// that populates the SHARED question bank every student practices
+// from — the highest-blast-radius of the three AI question-generation
+// paths in this app (the other two, aiQuizController.js and
+// aiQuestionController.js, only ever create a student's own personal
+// quiz or a single admin-reviewed question). Both of those already
+// instruct the AI to "re-derive the answer yourself from first
+// principles... before finalizing" as an explicit self-check step —
+// this file was missing that instruction entirely, meaning this
+// specific pipeline had no defense against the AI's own well-known
+// failure mode of confidently picking the wrong letter for a question
+// it otherwise phrased correctly. A student selecting the objectively
+// correct option would then be marked wrong because the STORED
+// correct_answer was itself mistaken — which is exactly what "wrong
+// answer allocated to the question" looks like from a student's
+// perspective. Added the same self-verification rule the other two
+// pipelines already have. This only improves questions generated going
+// forward — it does not retroactively fix any already-inserted rows,
+// which would need a separate content QA pass (spot-checking
+// source: 'ai_generated' rows against their PDF source) rather than a
+// code change.
 async function generateBatch(content, opts) {
   const { subject, examType, difficulty, count } = opts;
 
@@ -92,6 +114,7 @@ STRICT RULES:
 4. No backslashes or control characters in any text.
 5. Return ONLY a valid JSON object with a "questions" key. No markdown, no code fences, no extra text.
 6. Subject: "${subject}". Exam: "${examType}". Difficulty: "${difficulty}".
+7. Before finalizing each question, re-derive the answer yourself from first principles (redo any calculation, re-check any fact) and confirm it matches correct_answer — do not just assert an answer without checking it. If your first instinct was wrong, fix correct_answer accordingly.
 
 FORMAT (copy exactly):
 {"questions":[{"question":"...","option_a":"...","option_b":"...","option_c":"...","option_d":"...","correct_answer":"A","explanation":"...","topic":"..."}]}

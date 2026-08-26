@@ -145,29 +145,39 @@ async function updateTeamMissionProgress(studentId, missionType, amount = 1, io)
     if (!missions.length) return;
 
     for (const mission of missions) {
-      // Get or create progress
-      const existing = await db.query(
-        `SELECT current, completed FROM squad_mission_progress
-         WHERE squad_id=$1 AND mission_id=$2`,
-        [squadId, mission.id]
-      ).catch(() => ({ rows: [] }));
+      // FIX (worse version of the race fixed elsewhere this session):
+      // this used to SELECT current/completed, then a separate INSERT/
+      // UPDATE — not atomic. Since squad missions are updated by EVERY
+      // member's activity, this race is far easier to hit than a
+      // single-player claim race: two squad members finishing an exam
+      // within moments of each other both call this concurrently, both
+      // read completed=false, both compute newCurrent >= target, and
+      // both call completeMission — double-awarding coins/gems/XP to
+      // EVERY member of the squad, not just one student.
+      //
+      // Fixed with an atomic upsert: the INSERT...ON CONFLICT DO UPDATE
+      // does the read-modify-write as one statement, and completed=false
+      // in the WHERE-equivalent (the CASE) ensures a mission already
+      // marked complete can't be bumped further. RETURNING tells this
+      // exact call whether IT was the one that crossed the target,
+      // rather than a second concurrent call also seeing >= target from
+      // a stale read.
+      const upserted = await db.query(
+        `INSERT INTO squad_mission_progress (squad_id, mission_id, current)
+         VALUES ($1,$2,LEAST($3,$4))
+         ON CONFLICT (squad_id, mission_id) DO UPDATE SET
+           current = LEAST(squad_mission_progress.current + $3, $4)
+         WHERE squad_mission_progress.completed = false
+         RETURNING current, completed`,
+        [squadId, mission.id, amount, mission.target]
+      ).catch(err => {
+        if (err.code !== '42P01') console.error('squad_mission_progress upsert failed:', err.message);
+        return { rows: [] };
+      });
 
-      if (existing.rows[0]?.completed) continue;  // already done
-
-      const current   = parseInt(existing.rows[0]?.current || 0);
-      const newCurrent = Math.min(current + amount, mission.target);
-
-      if (!existing.rows.length) {
-        await db.query(
-          `INSERT INTO squad_mission_progress (squad_id, mission_id, current) VALUES ($1,$2,$3)`,
-          [squadId, mission.id, newCurrent]
-        ).catch(() => {});
-      } else {
-        await db.query(
-          `UPDATE squad_mission_progress SET current=$1 WHERE squad_id=$2 AND mission_id=$3`,
-          [newCurrent, squadId, mission.id]
-        ).catch(() => {});
-      }
+      if (!upserted.rows.length) continue; // already completed — WHERE clause excluded it, nothing to do
+      const newCurrent = upserted.rows[0].current;
+      const alreadyCompleted = upserted.rows[0].completed;
 
       // Broadcast progress to all squad members
       const members = await getSquadMembers(squadId);
@@ -183,9 +193,26 @@ async function updateTeamMissionProgress(studentId, missionType, amount = 1, io)
         }
       }
 
-      // Check completion
-      if (newCurrent >= mission.target) {
-        await completeMission(squadId, mission, members, io);
+      // Check completion — the atomic UPDATE above already guarantees
+      // only ONE concurrent caller can be the one whose current value
+      // actually crosses the target (everyone else's WHERE clause either
+      // saw completed=true already, or a current value that had already
+      // been bumped past target by the winner). Still double-check
+      // `!alreadyCompleted` so a call that lands exactly on an
+      // already-finished mission (edge case: two calls both push current
+      // to exactly `target` in the same instant) doesn't complete twice.
+      if (newCurrent >= mission.target && !alreadyCompleted) {
+        // Atomically flip completed — same compare-and-swap pattern:
+        // only the caller whose UPDATE actually flips false→true proceeds
+        // to award rewards.
+        const claim = await db.query(
+          `UPDATE squad_mission_progress SET completed=true, completed_at=NOW()
+           WHERE squad_id=$1 AND mission_id=$2 AND completed=false`,
+          [squadId, mission.id]
+        );
+        if (claim.rowCount > 0) {
+          await completeMission(squadId, mission, members, io);
+        }
       }
     }
   } catch (err) {
@@ -314,12 +341,17 @@ exports.resetDailyMissions = async (req, res) => {
     const dailyIds = TEAM_MISSIONS.filter(m => m.resetPeriod === 'daily').map(m => m.id);
     if (!dailyIds.length) return res.json({ reset: 0 });
 
+    // FIX: this used to run two DELETEs — the first scoped to
+    // completed=false, the second unconditional on the same mission_ids
+    // (to also clear completed ones for the new day). The second query's
+    // effect fully supersedes the first, but the response reported only
+    // the FIRST delete's rowCount — undercounting how many rows actually
+    // got reset (e.g. 3 incomplete + 5 completed = 8 actually deleted,
+    // but the response said "reset: 3"). Not a functional bug (the reset
+    // itself worked correctly either way), just a wrong number reported
+    // back to whoever's calling this. One unconditional DELETE does the
+    // same job in one round trip with an accurate count.
     const result = await db.query(
-      `DELETE FROM squad_mission_progress WHERE mission_id = ANY($1) AND completed=false`,
-      [dailyIds]
-    );
-    // Reset completed ones too (new day)
-    await db.query(
       `DELETE FROM squad_mission_progress WHERE mission_id = ANY($1)`,
       [dailyIds]
     );

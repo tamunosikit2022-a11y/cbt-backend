@@ -108,6 +108,24 @@ exports.useSkill = async (req, res) => {
     const { skill_id, question_id } = req.body;
     const sid = req.student.id;
 
+    // FIX: skills that need a question_id (fifty_fifty, smart_hint, and
+    // now retry_shield) used to validate that AFTER the charge was
+    // already decremented below — a request missing question_id, or
+    // naming a question_id that doesn't exist, still burned the
+    // student's paid charge for nothing. Validate everything about the
+    // request before touching their inventory, not after.
+    const NEEDS_QUESTION = ["fifty_fifty", "smart_hint", "retry_shield"];
+    let question = null;
+    if (NEEDS_QUESTION.includes(skill_id)) {
+      if (!question_id) return res.status(400).json({ error: "question_id is required for this skill." });
+      const q = await db.query(
+        "SELECT correct_answer, question, subject, topic FROM questions WHERE id=$1",
+        [question_id]
+      );
+      if (!q.rows.length) return res.status(404).json({ error: "Question not found." });
+      question = q.rows[0];
+    }
+
     const { rows } = await db.query(
       "SELECT quantity FROM student_skills WHERE student_id=$1 AND skill_id=$2",
       [sid, skill_id]
@@ -124,13 +142,29 @@ exports.useSkill = async (req, res) => {
     const skill  = ALL_SKILLS.find(s => s.id === skill_id);
     const result = { success: true, skill_id, remaining: rows[0].quantity - 1, effect: skill?.effect };
 
+    // FIX: this was the honest side of a scoring-integrity gap — quantity
+    // was correctly checked and decremented above, but nothing recorded
+    // THAT a shield was used, so submitExam had no way to verify a
+    // client's `shielded: true` claim against anything real (see
+    // migrations/skill_usage_log.sql for the full explanation). Log it
+    // now so grading can check.
+    if (skill_id === "retry_shield") {
+      await db.query(
+        `INSERT INTO skill_usage_log (student_id, skill_id, question_id) VALUES ($1,$2,$3)`,
+        [sid, skill_id, question_id]
+      ).catch(err => {
+        if (err.code !== '42P01') console.error('skill_usage_log insert failed:', err.message);
+        // Table not migrated yet — don't block the skill use itself (the
+        // student's coins are already spent, quantity already
+        // decremented); submitExam will simply fail-closed on the
+        // shield claim until this table exists, which is the safe
+        // direction to fail in.
+      });
+    }
+
     // ── fifty_fifty: eliminate 2 wrong options for the current question ──
     if (skill_id === "fifty_fifty") {
-      if (!question_id) return res.status(400).json({ error: "question_id is required for this skill." });
-      const q = await db.query("SELECT correct_answer FROM questions WHERE id=$1", [question_id]);
-      if (!q.rows.length) return res.status(404).json({ error: "Question not found." });
-      const correct = q.rows[0].correct_answer;
-      const wrongOptions = ["A","B","C","D"].filter(o => o !== correct);
+      const wrongOptions = ["A","B","C","D"].filter(o => o !== question.correct_answer);
       // Shuffle and drop 2 of the 3 wrong options to hide
       const hide = wrongOptions.sort(() => Math.random() - 0.5).slice(0, 2);
       result.hide_options = hide;
@@ -138,16 +172,13 @@ exports.useSkill = async (req, res) => {
 
     // ── smart_hint: AI-generated clue that does NOT reveal the answer ──
     if (skill_id === "smart_hint") {
-      if (!question_id) return res.status(400).json({ error: "question_id is required for this skill." });
-      const q = await db.query("SELECT question, subject, topic FROM questions WHERE id=$1", [question_id]);
-      if (!q.rows.length) return res.status(404).json({ error: "Question not found." });
       try {
         const { chatCompletion } = require("../utils/aiProvider");
         const completion = await chatCompletion({
           model: "openai/gpt-oss-20b",
           messages: [{
             role: "user",
-            content: `You are a JAMB tutor. A student is stuck on this ${q.rows[0].subject || ""} question:\n"${q.rows[0].question}"\n\nGive ONE short, helpful hint (max 25 words) that nudges them toward the right approach WITHOUT stating or implying which option (A, B, C, or D) is correct.`,
+            content: `You are a JAMB tutor. A student is stuck on this ${question.subject || ""} question:\n"${question.question}"\n\nGive ONE short, helpful hint (max 25 words) that nudges them toward the right approach WITHOUT stating or implying which option (A, B, C, or D) is correct.`,
           }],
           maxTokens: 80,
           temperature: 0.5,

@@ -14,7 +14,8 @@
  * Socket namespace: /school-wars
  */
 
-const db = require('../config/db');
+const db  = require('../config/db');
+const jwt = require('jsonwebtoken');
 
 const wars    = new Map();   // warId -> warObject
 const warRooms = new Map();  // warId -> socket room code
@@ -247,14 +248,93 @@ exports.joinWar = async (req, res) => {
   }
 };
 
+// FIX: extracted so there's exactly one path for actually recording a war
+// result, regardless of who/what calls it — arenaEngine.endGame() calls
+// this directly with the winning school it derived from its own
+// server-computed squad scores (the trustworthy path), while
+// war:record_result above is a thin wrapper that checks the caller is a
+// captain first, then defers to this (the manual/fallback path).
+let _schoolWarsNamespace = null; // set by initSchoolWars, used for broadcasts
+async function recordVerifiedWarResult(wId, winnerSchool) {
+  const war = wars.get(wId);
+  if (!war) return { success: false, error: 'War not found.' };
+  if (winnerSchool !== war.challengerSchool && winnerSchool !== war.rivalSchool)
+    return { success: false, error: 'winnerSchool must be one of the two warring schools.' };
+  if (war.status === 'finished') return { success: false, error: 'War already finished.' };
+
+  const ns = _schoolWarsNamespace;
+  war.roundResults.push({ round: war.round, winner: winnerSchool });
+
+  if (winnerSchool === war.challengerSchool) war.challengerWins++;
+  else war.rivalWins++;
+
+  const roundsToWin = Math.ceil(war.maxRounds / 2);
+
+  if (war.challengerWins >= roundsToWin || war.rivalWins >= roundsToWin) {
+    // War decided
+    war.status = 'finished';
+    const winningSide      = war.challengerWins >= roundsToWin ? 'challenger' : 'rival';
+    const decidingSchool   = winningSide === 'challenger' ? war.challengerSchool : war.rivalSchool;
+
+    await awardFactionXP(decidingSchool, war.factionXPReward);
+    await awardParticipants(war, winningSide);
+
+    ns?.to(wId).emit('war:finished', {
+      winner:          decidingSchool,
+      challengerWins:  war.challengerWins,
+      rivalWins:       war.rivalWins,
+      factionXP:       war.factionXPReward,
+      coinReward:      war.coinRewardWinner,
+    });
+
+    setTimeout(() => wars.delete(wId), 10 * 60 * 1000);
+  } else {
+    // Continue to next round
+    war.status = 'accepted';
+    ns?.to(wId).emit('war:round_end', {
+      roundWinner:     winnerSchool,
+      challengerWins:  war.challengerWins,
+      rivalWins:       war.rivalWins,
+      nextRound:       war.round + 1,
+    });
+  }
+
+  return { success: true };
+}
+
 // ── SOCKET ENGINE ──────────────────────────────────────────
 function initSchoolWars(io) {
   const ns = io.of('/school-wars');
+  _schoolWarsNamespace = ns;
+
+  // FIX: same missing-socket-auth pattern found across every real-time
+  // feature this session — see arenaEngine.js's arena.use() comment for
+  // the full writeup. This namespace has no frontend caller anywhere in
+  // the codebase (SchoolWars.js only uses the REST endpoints above,
+  // which are already properly authenticated via req.student) — dormant
+  // like tournaments/survival, but still directly reachable by anyone who
+  // connects a socket client to it, so fixing pre-emptively rather than
+  // waiting for it to ship.
+  ns.use((socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error("Authentication required."));
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      socket.data.studentId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error("Invalid or expired session. Please log in again."));
+    }
+  });
 
   ns.on('connection', socket => {
 
     // Captain starts the war (launches next round)
-    socket.on('war:start_round', async ({ warId: wId, captainId }, cb) => {
+    socket.on('war:start_round', async ({ warId: wId }, cb) => {
+      // FIX: captainId used to come from the client payload — any
+      // connected socket could claim to be either captain and control
+      // the war's round flow. Bound to the verified session instead.
+      const captainId = socket.data.studentId;
       const war = wars.get(wId);
       if (!war) return cb?.({ success: false, error: 'War not found.' });
       if (captainId !== war.challengerId && captainId !== war.rivalCaptainId)
@@ -270,6 +350,15 @@ function initSchoolWars(io) {
       war.currentRoomCode = code;
       warRooms.set(wId, code);
 
+      // FIX: register this room so arenaEngine.endGame() can call
+      // recordVerifiedWarResult directly using the winning squad IT
+      // computed from real server-tracked scores — the trustworthy path,
+      // no self-report involved. squadSchools maps the Arena room's
+      // 0/1 squad indices back to which real school each one is, since
+      // arenaEngine's room object has no concept of "school" on its own.
+      const { registerLink } = require('./matchLinkRegistry');
+      registerLink(code, { type: 'school-war', warId: wId, squadSchools: { 0: war.challengerSchool, 1: war.rivalSchool } });
+
       ns.to(wId).emit('war:round_start', {
         round: war.round, maxRounds: war.maxRounds,
         roomCode: code, subject: war.subject,
@@ -281,50 +370,37 @@ function initSchoolWars(io) {
       cb?.({ success: true, round: war.round, roomCode: code });
     });
 
-    // Record a round result (called internally when arena match ends)
+    // Record a round result (manual fallback — see recordVerifiedWarResult
+    // below for the primary, trustworthy path).
+    //
+    // FIX (critical): the "called internally when arena match ends"
+    // comment was never true — nothing anywhere in this codebase called
+    // war:record_result. It was a bare socket event with NO check at
+    // all — not even a captain check like start_round has — so any
+    // connected socket could declare an arbitrary winnerSchool for any
+    // warId, repeatedly, for unlimited Faction XP and coin farming.
+    //
+    // Two layers now fix this:
+    //   1. This endpoint requires the caller be one of the two captains
+    //      (closes "literally anyone can call this").
+    //   2. arenaEngine.js's endGame() now calls recordVerifiedWarResult
+    //      directly using the winning squad it computed from its own
+    //      server-tracked, JWT-verified scores — registered via
+    //      matchLinkRegistry.js when the war round's room code is handed
+    //      out above. This is the actual fix for the deeper problem: even
+    //      a captain-only submission is still a self-report two
+    //      colluding captains could fake. The Arena-driven path doesn't
+    //      ask either captain anything. This endpoint remains a manual
+    //      fallback for the rare case a room never reaches endGame.
     socket.on('war:record_result', async ({ warId: wId, winnerSchool }, cb) => {
+      const callerId = socket.data.studentId;
       const war = wars.get(wId);
-      if (!war) return cb?.({ success: false });
+      if (!war) return cb?.({ success: false, error: 'War not found.' });
+      if (callerId !== war.challengerId && callerId !== war.rivalCaptainId)
+        return cb?.({ success: false, error: 'Only captains can record a result.' });
 
-      war.roundResults.push({ round: war.round, winner: winnerSchool });
-
-      if (winnerSchool === war.challengerSchool) war.challengerWins++;
-      else war.rivalWins++;
-
-      const roundsToWin = Math.ceil(war.maxRounds / 2);
-
-      if (war.challengerWins >= roundsToWin || war.rivalWins >= roundsToWin) {
-        // War decided
-        war.status       = 'finished';
-        const winningSide  = war.challengerWins >= roundsToWin ? 'challenger' : 'rival';
-        const winnerSchool = winningSide === 'challenger' ? war.challengerSchool : war.rivalSchool;
-
-        await awardFactionXP(winnerSchool, war.factionXPReward);
-        await awardParticipants(war, winningSide);
-
-        ns.to(wId).emit('war:finished', {
-          winner:          winnerSchool,
-          challengerWins:  war.challengerWins,
-          rivalWins:       war.rivalWins,
-          factionXP:       war.factionXPReward,
-          coinReward:      war.coinRewardWinner,
-        });
-
-        // Cleanup after 10 minutes
-        setTimeout(() => wars.delete(wId), 10 * 60 * 1000);
-
-      } else {
-        // Continue to next round
-        war.status = 'accepted';
-        ns.to(wId).emit('war:round_end', {
-          roundWinner:     winnerSchool,
-          challengerWins:  war.challengerWins,
-          rivalWins:       war.rivalWins,
-          nextRound:       war.round + 1,
-        });
-      }
-
-      cb?.({ success: true });
+      const result = await recordVerifiedWarResult(wId, winnerSchool);
+      cb?.(result);
     });
 
     socket.on('war:join_room', ({ warId: wId }) => {
@@ -337,7 +413,7 @@ function initSchoolWars(io) {
   });
 }
 
-module.exports = { initSchoolWars, wars, warRooms,
+module.exports = { initSchoolWars, wars, warRooms, recordVerifiedWarResult,
   getWarLeaderboard: exports.getWarLeaderboard,
   getActiveWars: exports.getActiveWars,
   getWarHistory: exports.getWarHistory,

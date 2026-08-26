@@ -20,6 +20,7 @@
  */
 
 const db = require("../config/db");
+const jwt = require("jsonwebtoken");
 
 const rooms   = new Map();
 const players = new Map();
@@ -370,11 +371,68 @@ function endGame(io, room) {
     squadScores: SQUAD_MODES.has(room.mode) ? { 0: squadScore(room,0), 1: squadScore(room,1) } : null,
   });
   saveMatch(room);
+
+  // FIX: if this room belongs to a tournament match or school war round
+  // (registered via matchLinkRegistry when the room code was handed out),
+  // drive that result directly from what THIS server just computed —
+  // room.scores, built entirely from JWT-verified submit_answer calls —
+  // instead of waiting for either player to separately call
+  // submitMatchResult/war:record_result themselves. This is the
+  // trustworthy path: no client request, no self-report, no collusion
+  // surface. See matchLinkRegistry.js for the full reasoning.
+  try {
+    const { consumeLink } = require("./matchLinkRegistry");
+    const link = consumeLink(room.code);
+    if (link?.type === "tournament") {
+      const { recordVerifiedMatchResult } = require("../controllers/tournamentController");
+      const winnerId = final[0]?.playerId;
+      if (winnerId) recordVerifiedMatchResult(link.tournamentId, link.matchId, winnerId, io).catch(e => console.error("recordVerifiedMatchResult:", e.message));
+    } else if (link?.type === "school-war") {
+      const { recordVerifiedWarResult } = require("./schoolWarsEngine");
+      const winnerSchool = winningSquad === 0 ? link.squadSchools[0]
+                          : winningSquad === 1 ? link.squadSchools[1]
+                          : null; // draw — no result to record, war round doesn't advance
+      if (winnerSchool) recordVerifiedWarResult(link.warId, winnerSchool).catch(e => console.error("recordVerifiedWarResult:", e.message));
+    }
+  } catch (e) { console.error("endGame match-link error:", e.message); }
+
   setTimeout(() => rooms.delete(room.code), 10 * 60 * 1000);
 }
 
 function initArena(io) {
   const arena = io.of("/arena");
+
+  // FIX (critical): the ENTIRE Arena mode — the flagship real-time PvP
+  // feature — trusted `data.playerId` straight from the client on
+  // create_room/join_room with zero verification, then cached it as
+  // socket.playerId for the rest of the connection. Any connected socket
+  // could join or host a room AS ANY OTHER STUDENT ID, answer questions
+  // on their behalf, and walk away with (or hand them) real wins/losses,
+  // XP, coins, and arena_win_streak changes — directly manipulating
+  // another student's account without their knowledge, in the app's main
+  // competitive mode. This was the same missing-socket-auth gap as
+  // liveChallengeController (see server.js's io.use() comment for the
+  // base namespace fix), except Arena is its own namespace
+  // (io.of("/arena")) which that base-level fix does NOT cover — Socket.IO
+  // middleware does not automatically apply to sub-namespaces.
+  //
+  // Unlike the base-namespace fix, this one is STRICT (rejects the
+  // connection outright on missing/invalid token) rather than best-effort,
+  // because Arena's frontend socket (arenaSocket.js) is being updated
+  // alongside this to always send a real token — there's no existing
+  // no-token caller left to accidentally break, the way there was on the
+  // base namespace (which /classroom shares without sending a token yet).
+  arena.use((socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error("Authentication required."));
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      socket.data.studentId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error("Invalid or expired session. Please log in again."));
+    }
+  });
 
   arena.on("connection", socket => {
 
@@ -383,16 +441,32 @@ function initArena(io) {
         const { spendTokens } = require('../controllers/tokenController');
         const { isPremiumActive } = require('../controllers/adminPremiumController');
 
+        // FIX: playerId/playerName/avatar now come from the verified
+        // session (socket.data.studentId) and a DB lookup — never from
+        // the client payload — closing both the identity-spoofing hole
+        // above AND a lighter social-engineering angle (a socket
+        // claiming to be named/avatar'd as a specific real student to
+        // fool the other players in the room, even if the underlying id
+        // were somehow separately protected).
+        const playerId = socket.data.studentId;
+        const profile = await db.query(
+          `SELECT full_name, avatar_url FROM students WHERE id=$1`, [playerId]
+        ).then(r => r.rows[0]).catch(() => null);
+        if (!profile) return cb({ success: false, error: "Student account not found." });
+        const playerName = profile.full_name || "Student";
+        // avatar stays client-supplied — it's a cosmetic emoji picker with
+        // no identity implication, unlike name/id which are now verified.
+
         // Hosting is free for anyone currently "premium" — a real paid
         // subscriber OR a student covered by an active admin Free Day
         // event (isPremiumActive checks both). This is what the Arena
         // screen's own gate promises ("Free players can join... creating
         // and hosting is a Premium feature") and what a Free Day is
         // supposed to unlock. Everyone else still pays the 2-token fee.
-        const premium = await isPremiumActive(data.playerId).catch(() => false);
+        const premium = await isPremiumActive(playerId).catch(() => false);
         if (!premium) {
           try {
-            await spendTokens(data.playerId, 'arena_host');
+            await spendTokens(playerId, 'arena_host');
           } catch (tokenErr) {
             if (tokenErr.code === 'INSUFFICIENT_TOKENS') {
               return cb({ success: false, error: "🪙 Hosting a battle costs 2 tokens (it's free with Premium or during a Free Day event). Buy tokens from the Tokens page — 50 tokens for ₦200!" });
@@ -401,38 +475,46 @@ function initArena(io) {
           }
         }
         const code = genCode();
-        const room = newRoom({ ...data, code, host: { id: data.playerId, name: data.playerName } });
-        assignSquad(room, data.playerId);
-        room.players.set(socket.id, { id: data.playerId, name: data.playerName, avatar: data.avatar || "🧠", ready: true, socketId: socket.id });
-        room.scores.set(data.playerId, 0);
-        room.lives.set(data.playerId, LIVES_START);
+        const room = newRoom({ ...data, code, host: { id: playerId, name: playerName } });
+        assignSquad(room, playerId);
+        room.players.set(socket.id, { id: playerId, name: playerName, avatar: data.avatar || "🧠", ready: true, socketId: socket.id });
+        room.scores.set(playerId, 0);
+        room.lives.set(playerId, LIVES_START);
         rooms.set(code, room);
-        players.set(data.playerId, { socketId: socket.id, roomCode: code });
-        socket.join(code); socket.roomCode = code; socket.playerId = data.playerId; socket.playerName = data.playerName;
+        players.set(playerId, { socketId: socket.id, roomCode: code });
+        socket.join(code); socket.roomCode = code; socket.playerId = playerId; socket.playerName = playerName;
         cb({ success: true, code, room: safeRoom(room) });
         // Broadcast updated public list
         arena.emit("public_rooms_update", publicRoomsList());
       } catch (e) { cb({ success: false, error: e.message }); }
     });
 
-    socket.on("join_room", (data, cb) => {
+    socket.on("join_room", async (data, cb) => {
       const code = data.code?.toUpperCase().trim();
       const room = rooms.get(code);
       if (!room)                      return cb({ success: false, error: "Room not found." });
       if (room.status === "finished") return cb({ success: false, error: "Match already ended." });
 
+      // FIX: same identity binding as create_room above.
+      const playerId = socket.data.studentId;
+      const profile = await db.query(
+        `SELECT full_name FROM students WHERE id=$1`, [playerId]
+      ).then(r => r.rows[0]).catch(() => null);
+      if (!profile) return cb({ success: false, error: "Student account not found." });
+      const playerName = profile.full_name || "Student";
+
       // Reconnect
-      if (isInRoom(room, data.playerId)) {
-        room.players.forEach((p, sid) => { if (p.id === data.playerId) room.players.delete(sid); });
-        room.players.set(socket.id, { id: data.playerId, name: data.playerName, avatar: data.avatar || "🎓", ready: true, socketId: socket.id });
-        players.set(data.playerId, { socketId: socket.id, roomCode: code });
-        socket.join(code); socket.roomCode = code; socket.playerId = data.playerId; socket.playerName = data.playerName;
+      if (isInRoom(room, playerId)) {
+        room.players.forEach((p, sid) => { if (p.id === playerId) room.players.delete(sid); });
+        room.players.set(socket.id, { id: playerId, name: playerName, avatar: data.avatar || "🎓", ready: true, socketId: socket.id });
+        players.set(playerId, { socketId: socket.id, roomCode: code });
+        socket.join(code); socket.roomCode = code; socket.playerId = playerId; socket.playerName = playerName;
         cb({ success: true, reconnected: true, room: safeRoom(room) });
         if (room.status === "playing" && room.questions[room.currentQ]) {
           const { _correct, ...clientQ } = room.questions[room.currentQ];
           socket.emit("new_question", { question: clientQ, questionIndex: room.currentQ, totalQuestions: room.questions.length, timeLimit: room.timePerQuestion, scores: scoresArr(room), reconnected: true });
         }
-        arena.to(code).emit("player_reconnected", { name: data.playerName });
+        arena.to(code).emit("player_reconnected", { name: playerName });
         return;
       }
 
@@ -448,15 +530,15 @@ function initArena(io) {
       const cur = uniqueCount(room), max = MAX_PLAYERS[room.mode];
       if (cur >= max) return cb({ success: false, error: `Room full (${cur}/${max}).` });
 
-      const squad = assignSquad(room, data.playerId);
-      room.players.set(socket.id, { id: data.playerId, name: data.playerName, avatar: data.avatar || "🎓", ready: false, socketId: socket.id });
-      room.scores.set(data.playerId, 0);
-      room.lives.set(data.playerId, LIVES_START);
-      players.set(data.playerId, { socketId: socket.id, roomCode: code });
-      socket.join(code); socket.roomCode = code; socket.playerId = data.playerId; socket.playerName = data.playerName;
+      const squad = assignSquad(room, playerId);
+      room.players.set(socket.id, { id: playerId, name: playerName, avatar: data.avatar || "🎓", ready: false, socketId: socket.id });
+      room.scores.set(playerId, 0);
+      room.lives.set(playerId, LIVES_START);
+      players.set(playerId, { socketId: socket.id, roomCode: code });
+      socket.join(code); socket.roomCode = code; socket.playerId = playerId; socket.playerName = playerName;
 
       arena.to(code).emit("player_joined", {
-        player: { id: data.playerId, name: data.playerName, avatar: data.avatar, squad },
+        player: { id: playerId, name: playerName, avatar: data.avatar, squad },
         playerCount: uniqueCount(room), maxPlayers: max, room: safeRoom(room),
       });
       cb({ success: true, room: safeRoom(room) });

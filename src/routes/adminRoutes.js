@@ -66,6 +66,8 @@ router.use("/pdfs", pdfAdminRouter);
 router.get("/questions",                         admin.listQuestions);
 router.post("/questions",                        admin.addQuestion);
 router.delete("/questions/:id",                  admin.deleteQuestion);
+router.get("/question-reports",                  admin.listQuestionReports);
+router.post("/question-reports/:id/resolve",     admin.resolveQuestionReport);
 // ── AI Question Generation from PDF ──────────────────────
 router.post("/questions/generate-from-pdf",      qgen.uploadMiddleware, qgen.generateFromPdf);
 router.post("/questions/generate-from-url",      qgen.generateFromUrl);

@@ -178,16 +178,35 @@ exports.createEvent = async (req, res) => {
     );
 
     const event = result.rows[0];
-    activeEvent = event;
 
-    // Broadcast to all connected students
-    broadcastEventState(io, event, 'started');
+    // FIX: this used to unconditionally set `activeEvent = event` and
+    // broadcast 'started' right here, regardless of whether `start` was
+    // actually now or scheduled for later. isPremiumActive()'s cache-
+    // refresh guard only ever compares against end_at
+    // (`new Date() >= new Date(event.end_at)`), never start_at — so once
+    // a future-dated event was cached as `activeEvent`, every premium
+    // check would see a non-expired cached event and return true
+    // immediately, activating premium for the entire student base from
+    // the moment of *scheduling*, not the intended future start time.
+    // loadActiveEvent()'s own DB query correctly filters
+    // `NOW() BETWEEN start_at AND end_at` — the bug was purely in this
+    // in-memory shortcut bypassing that check. Now: only activate
+    // immediately if start is now-or-past; otherwise schedule a real
+    // activation timer for the future start time and leave activeEvent
+    // untouched (null, or whatever the previous genuinely-active event
+    // was) until then.
+    if (start <= new Date()) {
+      activeEvent = event;
+      broadcastEventState(io, event, 'started');
+    } else {
+      scheduleEventStart(io, event);
+    }
 
     // Schedule auto-end
     scheduleEventEnd(io, event);
 
     // Log
-    console.log(`[PREMIUM EVENT] "${event.name}" started — ends ${end.toISOString()}`);
+    console.log(`[PREMIUM EVENT] "${event.name}" ${start <= new Date() ? 'started' : 'scheduled'} — ${start <= new Date() ? 'ends' : 'starts ' + start.toISOString() + ', ends'} ${end.toISOString()}`);
 
     res.json({ success: true, event });
   } catch (err) {
@@ -204,6 +223,12 @@ exports.endEventEarly = async (req, res) => {
       [req.params.id]
     );
     if (eventTimer) { clearTimeout(eventTimer); eventTimer = null; }
+    // FIX: didn't clear startTimer — cancelling a not-yet-started
+    // (future-scheduled) event via this endpoint would set is_active=false
+    // in the DB, but the pending scheduleEventStart timer from createEvent
+    // would still fire later regardless and activate it anyway, since
+    // that timer has no awareness this endpoint was ever called.
+    if (startTimer) { clearTimeout(startTimer); startTimer = null; }
     activeEvent = null;
     broadcastEventState(io, null, 'ended');
     res.json({ success: true, message: 'Premium event ended.' });
@@ -258,6 +283,20 @@ exports.getPremiumStatus = async (req, res) => {
   }
 };
 
+// ── AUTO-START SCHEDULER (for events created with a future startAt) ────
+let startTimer = null;
+function scheduleEventStart(io, event) {
+  if (startTimer) clearTimeout(startTimer);
+  const ms = new Date(event.start_at) - new Date();
+  if (ms <= 0) { activeEvent = event; broadcastEventState(io, event, 'started'); return; }
+
+  startTimer = setTimeout(() => {
+    activeEvent = event;
+    broadcastEventState(io, event, 'started');
+    console.log(`[PREMIUM EVENT] "${event.name}" started (scheduled) — ends ${event.end_at}`);
+  }, ms);
+}
+
 // ── AUTO-END SCHEDULER ────────────────────────────────────
 function scheduleEventEnd(io, event) {
   if (eventTimer) clearTimeout(eventTimer);
@@ -285,12 +324,33 @@ function scheduleEventEnd(io, event) {
   }, ms);
 }
 
-// ── STARTUP: restore any active event on server restart ───
+// ── STARTUP: restore any active OR pending event on server restart ───
 exports.initPremiumEvents = async (io) => {
   const event = await loadActiveEvent();
   if (event) {
     console.log(`[PREMIUM EVENT] Restored active event: "${event.name}"`);
     scheduleEventEnd(io, event);
+    return;
+  }
+
+  // FIX: loadActiveEvent() only finds events where NOW() is already
+  // BETWEEN start_at AND end_at — a future-scheduled event (created with
+  // startAt in the future, per the scheduleEventStart fix above) doesn't
+  // match that until it actually starts. Without this, a server
+  // restart/redeploy between "event created" and "event's start time"
+  // would silently lose the pending activation forever — the timer that
+  // was going to flip it live at start_at only existed in the crashed
+  // process's memory, and nothing would ever re-arm it.
+  const { rows } = await db.query(
+    `SELECT * FROM premium_events
+     WHERE is_active = true AND start_at > NOW()
+     ORDER BY start_at ASC LIMIT 1`
+  ).catch(() => ({ rows: [] }));
+
+  if (rows[0]) {
+    console.log(`[PREMIUM EVENT] Restored pending event: "${rows[0].name}", starts ${rows[0].start_at}`);
+    scheduleEventStart(io, rows[0]);
+    scheduleEventEnd(io, rows[0]);
   }
 };
 

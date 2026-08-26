@@ -224,13 +224,59 @@ exports.submitExam = async (req, res) => {
     const correctMap = {};
     qResult.rows.forEach(q => { correctMap[q.id] = q; });
 
+    // FIX: submitExam used to trust `a.shielded` straight from the
+    // request body with zero server-side verification — anyone hitting
+    // this endpoint directly could mark every wrong answer "shielded"
+    // and score 100% for free, no purchase required (see
+    // migrations/skill_usage_log.sql for the full writeup). Now a shield
+    // claim only counts if there's a real, unconsumed, recent
+    // skill_usage_log row for that exact student+question — i.e. the
+    // student actually spent a Retry Shield charge via POST /skills/use
+    // on this question during this session. The 6-hour window bounds
+    // "recent" to roughly a plausible max exam-session length; a shield
+    // used long before this submission (e.g. on a question from a
+    // different, older attempt) doesn't carry forward.
+    //
+    // Fails CLOSED, not open: if this table isn't migrated yet in a given
+    // environment, validShieldIds stays empty and every shield claim is
+    // simply ignored (scored normally) rather than trusted by default —
+    // the opposite failure direction from most other graceful-degradation
+    // fallbacks in this codebase, deliberately, since client input isn't
+    // authoritative here the way a signed JWT is.
+    const claimedShieldIds = [...new Set(
+      answers.filter(a => a.shielded).map(a => a.question_id)
+    )];
+    let shieldLogByQuestion = {}; // question_id -> skill_usage_log.id
+    if (claimedShieldIds.length) {
+      const shieldRows = await db.query(
+        `SELECT id, question_id FROM skill_usage_log
+         WHERE student_id = $1 AND skill_id = 'retry_shield'
+           AND consumed_in_session_id IS NULL
+           AND used_at > NOW() - INTERVAL '6 hours'
+           AND question_id = ANY($2::int[])
+         ORDER BY used_at ASC`,
+        [student_id, claimedShieldIds]
+      ).catch(err => {
+        if (err.code !== '42P01') console.error('skill_usage_log lookup failed:', err.message);
+        return { rows: [] };
+      });
+      // One shield charge covers one question — first (oldest) unconsumed
+      // log row per question_id wins if there happen to be duplicates.
+      for (const row of shieldRows.rows) {
+        if (!(row.question_id in shieldLogByQuestion)) shieldLogByQuestion[row.question_id] = row.id;
+      }
+    }
+
     let score = 0;
     let scored = 0; // questions actually counted toward the score (shielded wrong answers are excluded)
+    const consumedShieldLogIds = [];
     const processed = answers.map(a => {
       const q = correctMap[a.question_id];
       if (!q) return null;
       const is_correct = (q.correct_answer || "").toUpperCase() === (a.selected_answer || "").toUpperCase();
-      const shielded    = !!a.shielded && !is_correct; // Retry Shield used + got it wrong → no penalty
+      const verifiedShieldLogId = shieldLogByQuestion[a.question_id];
+      const shielded = !!a.shielded && !is_correct && !!verifiedShieldLogId; // Retry Shield actually used + got it wrong → no penalty
+      if (shielded) consumedShieldLogIds.push(verifiedShieldLogId);
       if (!shielded) {
         scored++;
         if (is_correct) score++;
@@ -274,6 +320,18 @@ exports.submitExam = async (req, res) => {
          mode || "exam", total, score, percentage, time_taken_seconds || 0]
       );
       session_id = sessionRes.rows[0].id;
+
+      // Mark verified shields as consumed by this session — same
+      // transaction as the session insert, so a shield can't be
+      // double-claimed if this request is somehow retried/replayed, and
+      // the consumption rolls back together with everything else if any
+      // later step in this transaction fails.
+      if (consumedShieldLogIds.length) {
+        await client.query(
+          `UPDATE skill_usage_log SET consumed_in_session_id = $1 WHERE id = ANY($2::int[])`,
+          [session_id, consumedShieldLogIds]
+        );
+      }
 
       // Batch insert exam_answers — FIX: now saves explanation so history/revisits work
       if (processed.length > 0) {
@@ -358,7 +416,11 @@ exports.submitExam = async (req, res) => {
     );
 
     // Award XP: base 10 + bonus for score
-    const xpEarned = 10 + Math.floor(percentage / 10) * 2;
+    // FIX: active boosts (from chests/spins) were never actually applied
+    // anywhere — see src/utils/boosts.js for the full explanation.
+    const { getActiveMultiplier } = require("../utils/boosts");
+    const xpMultiplier = await getActiveMultiplier(student_id, 'xp');
+    const xpEarned = Math.round((10 + Math.floor(percentage / 10) * 2) * xpMultiplier);
     await db.query(
       `UPDATE students SET points = COALESCE(points,0) + $1 WHERE id = $2`,
       [xpEarned, student_id]
@@ -408,7 +470,8 @@ exports.submitExam = async (req, res) => {
     buildProfile(student_id).catch(() => {});
 
     // Award coins
-    const coinsEarned = 10 + Math.floor(percentage / 10);
+    const coinMultiplier = await getActiveMultiplier(student_id, 'coins');
+    const coinsEarned = Math.round((10 + Math.floor(percentage / 10)) * coinMultiplier);
     await db.query(
       `UPDATE students SET coins = COALESCE(coins,0) + $1 WHERE id = $2`,
       [coinsEarned, student_id]
@@ -640,9 +703,17 @@ exports.getInstitutions = async (req, res) => {
 // Ranks students by their performance on a specific university's exams —
 // separate from the global JAMB leaderboard, since a UNIPORT-only student
 // shouldn't be buried under thousands of JAMB-only scores.
-// Benchmark rule: only students averaging 50%+ across their UNIVERSITY
-// attempts qualify for the board — anything under 50% is excluded entirely,
-// not just ranked low.
+//
+// FIX: this used to rank (and display) by AVG(es.percentage) — a
+// student's average score across their attempts. That rewards rate, not
+// effort: someone who took ONE university exam and scored 100% ranked
+// above someone who took 50 exams averaging a still-strong 85%, despite
+// the second student clearly having put in far more sustained work.
+// Now ranks by SUM(es.percentage) — a running total of every score
+// they've earned — so consistent practice actually accumulates rank
+// instead of being diluted by it. avg_score is kept in the response for
+// context (still genuinely useful — "how well do they typically do") but
+// is no longer what determines position on the board.
 exports.getUniversityLeaderboard = async (req, res) => {
   const { institution, period = "all" } = req.query;
   if (!institution) return res.status(400).json({ error: "institution is required." });
@@ -655,6 +726,7 @@ exports.getUniversityLeaderboard = async (req, res) => {
     const result = await db.query(
       `SELECT s.id, s.full_name, s.avatar_url, s.school_name,
               COUNT(es.id)                 AS exams_taken,
+              ROUND(SUM(es.percentage),1)  AS total_score,
               ROUND(AVG(es.percentage),1)  AS avg_score,
               MAX(es.percentage)           AS best_score
        FROM students s
@@ -664,7 +736,7 @@ exports.getUniversityLeaderboard = async (req, res) => {
          AND es.institution = $1
          ${dateFilter}
        GROUP BY s.id, s.full_name, s.avatar_url, s.school_name
-       ORDER BY avg_score DESC, exams_taken DESC
+       ORDER BY total_score DESC, exams_taken DESC
        LIMIT 50`,
       [institution]
     );
@@ -789,6 +861,36 @@ exports.getSessionResults = async (req, res) => {
   }
 };
 
+
+// ── REPORT A QUESTION ─────────────────────────────────────
+// POST /api/exam/questions/:id/report
+// FIX: added while investigating "wrong questions allocated to wrong
+// answers" complaints — there was previously no way for a student to
+// flag a specific bad question, and no admin queue to review flags. This
+// doesn't fix any already-bad question by itself, but gives a real path
+// for existing bad content to actually get found and corrected, instead
+// of relying on word-of-mouth reports like the one that prompted this.
+exports.reportQuestion = async (req, res) => {
+  const questionId = parseInt(req.params.id);
+  const { reason } = req.body;
+  const student_id = req.student.id;
+
+  if (!Number.isInteger(questionId)) return res.status(400).json({ error: "Invalid question id." });
+  if (!reason || !reason.trim()) return res.status(400).json({ error: "Please describe what's wrong with this question." });
+
+  try {
+    await db.query(
+      `INSERT INTO question_reports (question_id, student_id, reason) VALUES ($1,$2,$3)`,
+      [questionId, student_id, reason.trim().slice(0, 1000)]
+    );
+    res.json({ success: true, message: "Thanks — this question has been flagged for review." });
+  } catch (err) {
+    if (err.code === '42P01') {
+      return res.status(503).json({ error: "Reporting isn't set up on this server yet." });
+    }
+    serverError(res, err);
+  }
+};
 
 // ── UNIVERSITY COURSE QUESTION COUNTS ────────────────────
 // GET /api/exam/university-course-counts

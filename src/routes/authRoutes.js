@@ -2,16 +2,27 @@ const express = require("express");
 const router  = express.Router();
 const auth    = require("../controllers/authController");
 const { requireStudent } = require("../middleware/auth");
+const { otpLimiter, otpVerifyLimiter, loginLimiter, registerLimiter, adminLoginLimiter } = require("../middleware/rateLimit");
 
 // ── PUBLIC ROUTES ─────────────────────────────────────────
-router.post("/register",        auth.register);
-router.post("/login",           auth.login);
-router.post("/admin/login",     auth.adminLogin);
+// loginLimiter/registerLimiter/adminLoginLimiter existed in rateLimit.js
+// but, like the OTP limiters before them, were never actually attached to
+// a route — these three endpoints had no rate limiting at all. adminLogin
+// especially: it's the single most sensitive credential in the app and
+// was completely unthrottled against brute force.
+router.post("/register",        registerLimiter,   auth.register);
+router.post("/login",           loginLimiter,       auth.login);
+router.post("/admin/login",     adminLoginLimiter,  auth.adminLogin);
 
 // Password reset — 6-digit OTP sent by email (Brevo)
-router.post("/forgot-password", auth.forgotPassword);
-router.post("/verify-otp",      auth.verifyOtp);
-router.post("/reset-password",  auth.resetPassword);
+// otpLimiter/otpVerifyLimiter were defined in rateLimit.js but never wired
+// up here — these three endpoints were completely unprotected, meaning the
+// 5-min/3-request DB check in forgotPassword was the only brake on sending
+// codes, and verify-otp had no attempt limit at all (brute-forceable 6-digit
+// code, 1M combinations, unlimited guesses).
+router.post("/forgot-password", otpLimiter,       auth.forgotPassword);
+router.post("/verify-otp",      otpVerifyLimiter, auth.verifyOtp);
+router.post("/reset-password",  otpVerifyLimiter, auth.resetPassword);
 
 // JWT refresh token rotation — silently renews 1h access token
 router.post("/refresh",         auth.refreshToken);

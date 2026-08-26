@@ -70,6 +70,30 @@ const SEASON_COSMETIC_SEEDS = [
 
 // ── SPIN WHEEL EVENT PRIZES (seasonal bonus) ──────────────
 
+// ── EVENT-EXCLUSIVE COSMETIC SEEDS ────────────────────────
+// FIX: buildEventSpinPrizes() below promises cosmetics like
+// 'halloween_ghost_frame' and 'xmas_gold_frame' as spin rewards, but
+// nothing ever inserted rows for them into season_cosmetics —
+// seedSeasonCosmetics() only seeded the 20 generic SEASON_COSMETIC_SEEDS
+// tier cosmetics, a completely different name set. awardSpinPrize's
+// cosmetic lookup (`WHERE name=$1`) always came back empty for any event
+// prize, so the grant was silently skipped while doEventSpin still told
+// the student they'd won it. These are the exact `reward.cosmetic`
+// strings referenced in buildEventSpinPrizes, so the name lookup there
+// actually resolves.
+//
+// tier is set well above the real season-pass range (1-20) specifically
+// so these never collide with SEASON_COSMETIC_SEEDS under the
+// UNIQUE(season_id, tier, type) constraint, and each gets its own unique
+// tier number (not shared by type) so multiple event items of the same
+// `type` don't collide with each other either.
+const EVENT_COSMETIC_SEEDS = [
+  { tier: 1001, type: 'avatar_frame',   name: 'halloween_ghost_frame', rarity: 'epic',      preview: '👻' },
+  { tier: 1002, type: 'spirit_skin',    name: 'halloween_dark_skin',   rarity: 'legendary', preview: '🕷️' },
+  { tier: 1003, type: 'avatar_frame',   name: 'xmas_gold_frame',       rarity: 'legendary', preview: '🎄' },
+  { tier: 1004, type: 'avatar_frame',   name: 'season_trophy_frame',   rarity: 'mythic',     preview: '🏆' },
+];
+
 function buildEventSpinPrizes(eventName) {
   const events = {
     halloween: [
@@ -103,11 +127,15 @@ exports.getSeasonCosmetics = async (req, res) => {
     const sid = req.student.id;
 
     const [cosmetics, owned] = await Promise.all([
+      // tier < 1000 excludes event-exclusive spin prizes (see
+      // EVENT_COSMETIC_SEEDS) — those are spin-only, never tier-unlockable,
+      // so they'd otherwise show up here permanently "locked" and clutter
+      // the season-pass progression list.
       db.query(`
         SELECT sc.*, se.name as season_name, se.season_number
         FROM season_cosmetics sc
         JOIN seasons se ON se.id = sc.season_id
-        WHERE se.is_active = true
+        WHERE se.is_active = true AND sc.tier < 1000
         ORDER BY sc.tier
       `).catch(() => ({ rows: [] })),
 
@@ -160,16 +188,26 @@ exports.claimSeasonCosmetic = async (req, res) => {
     if (cosmetic.tier > parseInt(tierRow?.tier || 0))
       return res.status(403).json({ error: `You need Season Tier ${cosmetic.tier} to claim this.` });
 
+    // FIX: student_season_cosmetics has a PRIMARY KEY (student_id,
+    // cosmetic_id), so a genuine race here can't double-grant — the
+    // losing concurrent request's INSERT fails with a unique_violation.
+    // It was falling through to a raw 500 (serverError) though, instead
+    // of the same clean "Already claimed" message the earlier check
+    // above gives a non-racing duplicate request.
     await db.query(
       `INSERT INTO student_season_cosmetics (student_id, cosmetic_id) VALUES ($1,$2)`,
       [sid, cosmeticId]
-    );
+    ).catch(err => {
+      if (err.code === '23505') { const e = new Error('Already claimed.'); e.code = 'ALREADY_CLAIMED'; throw e; }
+      throw err;
+    });
 
     // Fire micro-interaction
     fxSeasonReward(io, sid, { reward: cosmetic, tier: cosmetic.tier });
 
     res.json({ success: true, cosmetic });
   } catch (err) {
+    if (err.code === 'ALREADY_CLAIMED') return res.status(400).json({ error: err.message });
     serverError(res, err);
   }
 };
@@ -272,50 +310,68 @@ exports.getActiveSpinEvent = async (req, res) => {
 
 // POST /api/spin-events/spin (event-exclusive spin — uses event tokens)
 exports.doEventSpin = async (req, res) => {
+  // FIX: this used to deduct the event-spin token and award the prize as
+  // two separate, unguarded writes, then respond { success:true, prize }
+  // unconditionally — awardSpinPrize swallowed its own errors internally
+  // (including the "cosmetic name not found" case, which was ALWAYS true
+  // for event prizes, see EVENT_COSMETIC_SEEDS above), so a student could
+  // be told they won a legendary/mythic reward and receive nothing, with
+  // their token already spent either way. Now the whole thing is one
+  // transaction: if the grant genuinely fails (e.g. this environment's
+  // migration hasn't seeded EVENT_COSMETIC_SEEDS yet), it rolls back —
+  // token isn't spent, and the response says so honestly instead of
+  // claiming success.
+  const client = await db.connect();
   try {
     const sid = req.student.id;
     const io  = req.app.get('io');
 
-    // Check active event
-    const event = await db.query(
+    const event = await client.query(
       `SELECT * FROM spin_events WHERE NOW() BETWEEN start_at AND end_at ORDER BY id DESC LIMIT 1`
     ).catch(() => ({ rows: [] }));
-    if (!event.rows.length) return res.status(400).json({ error: 'No active spin event.' });
-
+    if (!event.rows.length) { client.release(); return res.status(400).json({ error: 'No active spin event.' }); }
     const ev = event.rows[0];
 
-    // Check event spin tokens
-    const tokenRow = await db.query(
+    const tokenRow = await client.query(
       `SELECT COALESCE(event_spin_tokens,0) as tokens FROM students WHERE id=$1`, [sid]
     );
     const tokens = parseInt(tokenRow.rows[0]?.tokens || 0);
-    if (tokens < 1) return res.status(400).json({ error: 'No event spin tokens. Earn them through event missions!' });
+    if (tokens < 1) { client.release(); return res.status(400).json({ error: 'No event spin tokens. Earn them through event missions!' }); }
 
-    // Deduct token
-    await db.query(
-      `UPDATE students SET event_spin_tokens = COALESCE(event_spin_tokens,0) - 1 WHERE id=$1`, [sid]
-    );
-
-    // Pick a prize using weighted random
     const prizes = ev.prizes || buildEventSpinPrizes(ev.event_type);
     const prize  = weightedRandom(prizes);
 
-    // Award the prize
-    await awardSpinPrize(sid, prize);
+    await client.query('BEGIN');
+    try {
+      await client.query(
+        `UPDATE students SET event_spin_tokens = COALESCE(event_spin_tokens,0) - 1 WHERE id=$1`, [sid]
+      );
 
-    // Micro-interaction
+      const granted = await awardSpinPrize(client, sid, prize);
+      if (!granted) {
+        await client.query('ROLLBACK');
+        console.error(`Spin prize grant failed for student ${sid}, prize:`, prize);
+        return res.status(500).json({ error: "Couldn't award your prize — your spin token hasn't been used. Please try again." });
+      }
+
+      await client.query(
+        `INSERT INTO spin_results (student_id, prize_label, prize_type, prize_rarity, source, spun_at)
+         VALUES ($1,$2,$3,$4,'event',NOW())`,
+        [sid, prize.label, prize.type, prize.rarity]
+      ).catch(() => {}); // analytics-only, never worth failing the spin over
+
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    }
+
     fxSpinWin(io, sid, { reward: prize.label, rarity: prize.rarity });
-
-    // Log
-    await db.query(
-      `INSERT INTO spin_results (student_id, prize_label, prize_type, prize_rarity, source, spun_at)
-       VALUES ($1,$2,$3,$4,'event',NOW())`,
-      [sid, prize.label, prize.type, prize.rarity]
-    ).catch(() => {});
-
     res.json({ success: true, prize, remainingTokens: tokens - 1 });
   } catch (err) {
     serverError(res, err);
+  } finally {
+    client.release();
   }
 };
 
@@ -359,7 +415,20 @@ exports.seedSeasonCosmetics = async (req, res) => {
       ).catch(() => {});
     }
 
-    res.json({ success: true, seeded: SEASON_COSMETIC_SEEDS.length });
+    // FIX: event-exclusive spin prizes (see EVENT_COSMETIC_SEEDS above)
+    // were never seeded anywhere, so they could never actually be won —
+    // seed them alongside the regular tier cosmetics here so one admin
+    // action keeps both in sync.
+    for (const c of EVENT_COSMETIC_SEEDS) {
+      await db.query(
+        `INSERT INTO season_cosmetics (season_id, tier, type, name, rarity, preview_url)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (season_id, tier, type) DO UPDATE SET name=$4, rarity=$5, preview_url=$6`,
+        [seasonId, c.tier, c.type, c.name, c.rarity, c.preview || '']
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, seeded: SEASON_COSMETIC_SEEDS.length + EVENT_COSMETIC_SEEDS.length });
   } catch (err) {
     serverError(res, err);
   }
@@ -377,28 +446,60 @@ function weightedRandom(prizes) {
   return prizes[prizes.length - 1];
 }
 
-async function awardSpinPrize(studentId, prize) {
+// Returns true if the prize was actually granted, false otherwise — the
+// caller (doEventSpin) uses this to decide whether to commit or roll back
+// the token deduction, instead of the old behavior of always claiming
+// success regardless of what actually happened.
+async function awardSpinPrize(client, studentId, prize) {
   try {
     if (prize.type === 'coins' && prize.reward.coins) {
-      await db.query(`UPDATE students SET coins=COALESCE(coins,0)+$1 WHERE id=$2`,
+      await client.query(`UPDATE students SET coins=COALESCE(coins,0)+$1 WHERE id=$2`,
         [prize.reward.coins, studentId]);
-    } else if (prize.type === 'gems' && prize.reward.gems) {
-      await db.query(`UPDATE students SET gems=COALESCE(gems,0)+$1 WHERE id=$2`,
-        [prize.reward.gems, studentId]);
-    } else if (prize.type === 'cosmetic' && prize.reward.cosmetic) {
-      const cos = await db.query(
-        `SELECT id FROM season_cosmetics WHERE name=$1 LIMIT 1`, [prize.reward.cosmetic]
-      ).catch(() => ({ rows: [] }));
-      if (cos.rows.length) {
-        await db.query(
-          `INSERT INTO student_season_cosmetics (student_id, cosmetic_id)
-           VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-          [studentId, cos.rows[0].id]
-        ).catch(() => {});
-      }
+      return true;
     }
+    if (prize.type === 'gems' && prize.reward.gems) {
+      await client.query(`UPDATE students SET gems=COALESCE(gems,0)+$1 WHERE id=$2`,
+        [prize.reward.gems, studentId]);
+      return true;
+    }
+    if (prize.type === 'cosmetic' && prize.reward.cosmetic) {
+      const cos = await client.query(
+        `SELECT id FROM season_cosmetics WHERE name=$1 LIMIT 1`, [prize.reward.cosmetic]
+      );
+      if (!cos.rows.length) return false; // not seeded in this environment — see EVENT_COSMETIC_SEEDS
+      await client.query(
+        `INSERT INTO student_season_cosmetics (student_id, cosmetic_id)
+         VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [studentId, cos.rows[0].id]
+      );
+      return true;
+    }
+    // FIX: 'title' prizes (e.g. season_finale's 'season_legend') had no
+    // handler at all — silently fell through every branch above with no
+    // grant and no error.
+    if (prize.type === 'title' && prize.reward.title) {
+      await client.query(
+        `INSERT INTO student_titles (student_id, title_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [studentId, prize.reward.title]
+      );
+      return true;
+    }
+    if (prize.type === 'boost' && prize.reward.boost) {
+      // Reuses the same student_boosts table spinController.js already
+      // writes to for regular (non-event) boost spins — was previously
+      // unhandled here entirely, always silently ungranted.
+      const durationSeconds = prize.reward.duration || 3600;
+      await client.query(
+        `INSERT INTO student_boosts (student_id, boost_type, multiplier, expires_at)
+         VALUES ($1,$2,$3,NOW() + ($4 || ' seconds')::interval)`,
+        [studentId, prize.reward.boost, 2.0, durationSeconds]
+      );
+      return true;
+    }
+    return false; // unrecognized prize shape
   } catch (err) {
     console.error('awardSpinPrize error:', err.message);
+    return false;
   }
 }
 

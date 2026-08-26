@@ -107,7 +107,18 @@ function registerSpiritSkills(arena, rooms, players) {
     // ── ACTIVATE SPIRIT SKILL ─────────────────────────────
     socket.on('spirit:activate', async (data, cb) => {
       try {
-        const { playerId, roomCode } = data;
+        // FIX: playerId used to come from the client payload — this
+        // namespace (/arena) now verifies identity via the arena.use()
+        // JWT middleware registered in arenaEngine.js (this handler
+        // attaches to the same namespace object via registerSpiritSkills,
+        // so it already benefits from that check) — just needed to
+        // actually use socket.data.studentId instead of trusting the
+        // payload. Previously any socket could activate (and burn the
+        // once-per-match charge on) another player's equipped spirit
+        // skill — including granting THEM crystal_phoenix's revive or
+        // ember_wyrm's 2× XP/coins boost on command.
+        const playerId = socket.data.studentId;
+        const { roomCode } = data;
         const room = rooms.get(roomCode?.toUpperCase());
 
         if (!room || room.status !== 'playing') {
@@ -209,7 +220,9 @@ function registerSpiritSkills(arena, rooms, players) {
     // ── QUERY SKILL STATUS ─────────────────────────────────
     socket.on('spirit:status', async (data, cb) => {
       try {
-        const { playerId, roomCode } = data;
+        // FIX: same identity-binding as spirit:activate above.
+        const playerId = socket.data.studentId;
+        const { roomCode } = data;
         const state = getSkillState(roomCode, playerId);
 
         const equippedRow = await db.query(

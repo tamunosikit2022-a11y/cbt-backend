@@ -644,6 +644,45 @@ exports.deleteQuestion = async (req, res) => {
   } catch(err) { serverError(res, err); }
 };
 
+// ── QUESTION REPORTS (student-flagged bad questions) ──────
+// GET /api/admin/question-reports?status=open
+exports.listQuestionReports = async (req, res) => {
+  try {
+    const status = req.query.status || 'open';
+    const { rows } = await db.query(
+      `SELECT qr.*, q.question, q.option_a, q.option_b, q.option_c, q.option_d,
+              q.correct_answer, q.subject, s.full_name as reported_by_name
+       FROM question_reports qr
+       LEFT JOIN questions q ON q.id = qr.question_id
+       LEFT JOIN students s  ON s.id = qr.student_id
+       WHERE qr.status = $1
+       ORDER BY qr.created_at DESC LIMIT 100`,
+      [status]
+    ).catch(err => {
+      if (err.code === '42P01') return { rows: [] };
+      throw err;
+    });
+    res.json({ reports: rows });
+  } catch (err) { serverError(res, err); }
+};
+
+// POST /api/admin/question-reports/:id/resolve   body: { status: 'resolved'|'dismissed' }
+exports.resolveQuestionReport = async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!['resolved', 'dismissed'].includes(status)) {
+      return res.status(400).json({ error: "status must be 'resolved' or 'dismissed'." });
+    }
+    const result = await db.query(
+      `UPDATE question_reports SET status=$1, resolved_at=NOW(), resolved_by=$2
+       WHERE id=$3 RETURNING id`,
+      [status, req.admin?.id || null, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Report not found.' });
+    res.json({ success: true });
+  } catch (err) { serverError(res, err); }
+};
+
 // ── SPIN HISTORY ──────────────────────────────────────────
 exports.getSpinHistory = async (req, res) => {
   try {

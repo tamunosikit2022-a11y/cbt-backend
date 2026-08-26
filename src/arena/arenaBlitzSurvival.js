@@ -25,6 +25,7 @@
  */
 
 const db      = require('../config/db');
+const jwt     = require('jsonwebtoken');
 const { applyBoosts }                     = require('./spiritSkillsHandler');
 const { checkBadgesForStudent, awardBadge } = require('../controllers/badgesController');
 const { fxVictory, fxDefeat, fxCoinFly, fxScreenFlash } = require('../controllers/microController');
@@ -86,6 +87,26 @@ function blitzScore(answers) {
 
 function initBlitz(io) {
   const ns = io.of('/blitz');
+
+  // FIX: same missing-socket-auth pattern as arenaEngine.js's main /arena
+  // namespace (see the detailed comment there) — blitz:queue trusted a
+  // client-supplied playerId directly, cached as socket.blitzPlayerId,
+  // then used for all scoring and the coin/XP/blitz_wins rewards in
+  // endBlitz below. Any socket could queue and answer as any other
+  // student. This namespace's frontend (BlitzMode.js) already sends
+  // `auth: { token }` — it just wasn't being verified — so this is a
+  // safe, non-breaking, strict (connection-rejecting) fix.
+  ns.use((socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error("Authentication required."));
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      socket.data.studentId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error("Invalid or expired session. Please log in again."));
+    }
+  });
 
   // Matchmaking queue: subject -> { ranked } -> [{ socketId, playerId, name, ... }]
   const queue = new Map();
@@ -230,7 +251,14 @@ function initBlitz(io) {
   ns.on('connection', socket => {
 
     // ── JOIN QUEUE ───────────────────────────────────────
-    socket.on('blitz:queue', ({ playerId, playerName, subject = 'Mixed', ranked = false, maxPlayers = 2 }, cb) => {
+    socket.on('blitz:queue', async ({ subject = 'Mixed', ranked = false, maxPlayers = 2 }, cb) => {
+      // FIX: playerId/playerName now come from the verified session, not
+      // the client payload — see comment on ns.use() above.
+      const playerId = socket.data.studentId;
+      const profile = await db.query(`SELECT full_name FROM students WHERE id=$1`, [playerId]).then(r => r.rows[0]).catch(() => null);
+      if (!profile) return cb?.({ success: false, error: 'Student account not found.' });
+      const playerName = profile.full_name || 'Student';
+
       const q = getQueue(subject, ranked);
 
       // Avoid duplicate
@@ -318,10 +346,34 @@ function newSurvivalRoom(opts) {
 function initSurvival(io) {
   const ns = io.of('/survival');
 
+  // FIX: same missing-socket-auth pattern — see ns.use() comment on
+  // initBlitz above. This namespace has no frontend caller anywhere in
+  // the codebase yet (dormant feature, like tournaments/live-challenges),
+  // so this is a pre-emptive fix rather than one closing an actively
+  // exploited hole — still worth closing before it ships.
+  ns.use((socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error("Authentication required."));
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      socket.data.studentId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error("Invalid or expired session. Please log in again."));
+    }
+  });
+
   ns.on('connection', socket => {
 
     // ── CREATE / JOIN ROOM ───────────────────────────────
-    socket.on('survival:join', async ({ playerId, playerName, roomCode: code, subject = 'Mixed', maxPlayers = 20, lives = 0 }, cb) => {
+    socket.on('survival:join', async ({ roomCode: code, subject = 'Mixed', maxPlayers = 20, lives = 0 }, cb) => {
+      // FIX: playerId/playerName now come from the verified session, not
+      // the client payload — see ns.use() comment above.
+      const playerId = socket.data.studentId;
+      const profile = await db.query(`SELECT full_name FROM students WHERE id=$1`, [playerId]).then(r => r.rows[0]).catch(() => null);
+      if (!profile) return cb?.({ success: false, error: 'Student account not found.' });
+      const playerName = profile.full_name || 'Student';
+
       let room = survivalRooms.get(code);
 
       if (!room) {
